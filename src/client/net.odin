@@ -110,6 +110,11 @@ Server_Conn :: struct {
 	setup_error:   string,
 	msg_input:     Text_Input,
 
+	// Eingabefeld-Scroll (Inhalt höher als die Box → Scrollbar + Mausrad)
+	input_scroll:      Scroll,
+	input_last_cursor: int, // Cursor-Bewegung erkennen → Caret sichtbar halten
+	input_last_len:    int,
+
 	device_key: ^DeviceKey,
 }
 

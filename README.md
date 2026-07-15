@@ -48,6 +48,7 @@ ein (Servername).
 | `Esc` | Modal schließen, sonst ans Chat-Ende springen |
 | `Bild↑ / Bild↓` | im Verlauf blättern |
 | `Strg+A/C/X/V`, Shift+Pfeile, Doppelklick | Textauswahl & Zwischenablage im Eingabefeld |
+| `↑ / ↓` im Eingabefeld | zwischen den Zeilen navigieren; bei viel Inhalt scrollt das Feld (auch per Mausrad/Scrollbar) |
 
 Klick auf Avatar oder Namen einer Nachricht öffnet die Direktnachricht mit
 der Person. Der Zähler im Kanal-Header öffnet die Mitgliederverwaltung.

@@ -499,20 +499,82 @@ draw_message_input :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, chat:
 	}
 	rrect_lines(box, RADIUS_INPUT, focused ? 1.6 : 1, mix(COL_BORDER, COL_ACCENT, ft))
 
-	// Cursor-Zeile bestimmen (für Sichtbarkeit beim Scrollen)
-	caret_line := 0
-	for l, i in lines {
-		if ti.cursor >= l.start && ti.cursor <= l.end {
-			caret_line = i
+	// Cursor-Zeile bestimmen (Zeilennavigation + Sichtbarkeit beim Scrollen)
+	caret_line_of :: proc(lines: []Input_Line, cursor: int) -> int {
+		cl := 0
+		for l, i in lines {
+			if cursor >= l.start && cursor <= l.end {
+				cl = i
+			}
+		}
+		return cl
+	}
+	caret_line := caret_line_of(lines[:], ti.cursor)
+
+	// ↑/↓: zwischen den Zeilen navigieren, Shift erweitert die Selektion.
+	// (Alt+↑/↓ bleibt der Channel-Wechsel.)
+	if focused && !alt_down() {
+		move := 0
+		if key_pressed(.UP) {
+			move = -1
+		}
+		if key_pressed(.DOWN) {
+			move = +1
+		}
+		if move != 0 {
+			extend := shift_down()
+			tgt := caret_line + move
+			if tgt < 0 {
+				ti_move(ti, 0, extend)
+			} else if tgt >= len(lines) {
+				ti_move(ti, len(ti.runes), extend)
+			} else {
+				// x-Position des Cursors in der Zielzeile halten („goal column")
+				cx := f32(0)
+				for j := lines[caret_line].start; j < ti.cursor; j += 1 {
+					cx += rune_width(app, ti.runes[j])
+				}
+				l := lines[tgt]
+				idx := l.end
+				x := f32(0)
+				for j := l.start; j < l.end; j += 1 {
+					w := rune_width(app, ti.runes[j])
+					if cx < x + w/2 {
+						idx = j
+						break
+					}
+					x += w
+				}
+				ti_move(ti, idx, extend)
+			}
+			caret_reset(app)
+			caret_line = caret_line_of(lines[:], ti.cursor)
 		}
 	}
-	first := clamp(caret_line - n_shown + 1, 0, max(0, len(lines) - n_shown))
-	text_y0 := box.y + 10
+
+	// Scroll-Zustand: Mausrad über dem Feld scrollt; bewegt sich der
+	// Cursor (Tippen, Pfeile, Klick), wird seine Zeile sichtbar gehalten.
+	line_h := f32(24)
+	content_h := f32(len(lines)) * line_h
+	visible_h := box_h - 20
+	max_scroll := max(0, content_h - visible_h)
+	if ti.cursor != c.input_last_cursor || len(ti.runes) != c.input_last_len {
+		c.input_last_cursor = ti.cursor
+		c.input_last_len = len(ti.runes)
+		cy0 := f32(caret_line) * line_h
+		if cy0 < c.input_scroll.target {
+			c.input_scroll.target = cy0
+		} else if cy0 + line_h > c.input_scroll.target + visible_h {
+			c.input_scroll.target = cy0 + line_h - visible_h
+		}
+	}
+	scroll_update(app, &c.input_scroll, ui_hover(&app.ui, text_area, .Base), max_scroll, 48)
+	text_y0 := box.y + 10 - c.input_scroll.pos
 
 	// Maus: Cursor setzen / Selektion ziehen / Doppelklick Wort
 	if app.ui.layer == .Base {
-		mouse_to_index :: proc(app: ^App, lines: []Input_Line, runes: []rune, first, n_shown: int, tx, ty0: f32) -> int {
-			li := clamp(int((app.ui.mouse.y - ty0) / 24) + first, 0, len(lines) - 1)
+		mouse_to_index :: proc(app: ^App, lines: []Input_Line, runes: []rune, tx, ty0: f32) -> int {
+			li := clamp(int((app.ui.mouse.y - ty0) / 24), 0, len(lines) - 1)
 			l := lines[li]
 			rel := app.ui.mouse.x - tx
 			// Index innerhalb der Zeile suchen
@@ -528,7 +590,7 @@ draw_message_input :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, chat:
 		}
 		if app.ui.clicked && rl.CheckCollisionPointRec(app.ui.mouse, text_area) {
 			app.ui.focus = .Message
-			idx := mouse_to_index(app, lines[:], ti.runes[:], first, n_shown, box.x + pad, text_y0)
+			idx := mouse_to_index(app, lines[:], ti.runes[:], box.x + pad, text_y0)
 			if app.ui.double_click {
 				ti_select_word(ti, idx)
 			} else {
@@ -538,7 +600,7 @@ draw_message_input :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, chat:
 			caret_reset(app)
 		}
 		if app.ui.drag_focus == .Message && app.ui.mouse_down && !app.ui.clicked {
-			idx := mouse_to_index(app, lines[:], ti.runes[:], first, n_shown, box.x + pad, text_y0)
+			idx := mouse_to_index(app, lines[:], ti.runes[:], box.x + pad, text_y0)
 			ti_move(ti, idx, true)
 		}
 	}
@@ -557,8 +619,14 @@ draw_message_input :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, chat:
 
 	lo, hi := ti_sel_range(ti)
 	ly := text_y0
-	for i := first; i < len(lines) && i < first + n_shown; i += 1 {
-		l := lines[i]
+	for l, i in lines {
+		if ly > box.y + box.height {
+			break
+		}
+		if ly + 24 < box.y {
+			ly += 24
+			continue
+		}
 		// Selektion hinterlegen
 		if focused && lo < hi {
 			seg_lo := max(lo, l.start)
@@ -587,6 +655,11 @@ draw_message_input :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, chat:
 		ly += 24
 	}
 	scissor_end()
+
+	// Scrollbar, sobald der Inhalt höher ist als die Box.
+	// content-Parameter so gewählt, dass max_scroll exakt dem des Feldes entspricht.
+	sb_area := rl.Rectangle{box.x, box.y + 2, box.width - send_w, box.height - 4}
+	scrollbar(app, sb_area, max_scroll + sb_area.height, &c.input_scroll, .Base)
 
 	// Senden-Button
 	has_text := len(strings.trim_space(ti_text(ti))) > 0
