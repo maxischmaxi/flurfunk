@@ -106,7 +106,7 @@ build_items :: proc(app: ^App, c: ^Server_Conn, query: string) -> []Switch_Item 
 
 draw_quick_switcher :: proc(app: ^App, c: ^Server_Conn, sw, sh: f32) {
 	t := anim_to(app, anim_id(.Modal_Open, 1), 1, 16, initial = 0)
-	rl.DrawRectangleRec({0, 0, sw, sh}, fade(rl.Color{9, 9, 11, 255}, 0.45*t))
+	rl.DrawRectangleRec({0, 0, sw, sh}, fade(COL_SCRIM, t))
 
 	query := strings.trim_space(ti_text(&app.modal_input))
 	items := build_items(app, c, query)
@@ -120,7 +120,8 @@ draw_quick_switcher :: proc(app: ^App, c: ^Server_Conn, sw, sh: f32) {
 	p := rl.Rectangle{x, y, w, h}
 
 	draw_shadow(p, RADIUS_CARD, t)
-	rrect(p, RADIUS_CARD, fade(COL_WHITE, t))
+	rrect(p, RADIUS_CARD, fade(COL_SURFACE, t))
+	rrect_lines(p, RADIUS_CARD, 1, fade(COL_BORDER, t))
 
 	// Suchfeld
 	submitted := text_field(app, {x + 20, y + 20, w - 40, 44}, &app.modal_input, .Switcher, .Modal,
@@ -156,7 +157,7 @@ draw_quick_switcher :: proc(app: ^App, c: ^Server_Conn, sw, sh: f32) {
 			rrect(r, 8, fade(COL_ACCENT, 0.12))
 			rrect_lines(r, 8, 1.4, fade(COL_ACCENT, 0.7))
 		} else if hovered {
-			rrect(r, 8, fade(rl.Color{24, 24, 27, 255}, 0.05))
+			rrect(r, 8, fade(COL_OVERLAY, 0.05))
 		}
 
 		ix := x + 24

@@ -41,6 +41,9 @@ Anim_Kind :: enum u8 {
 	Tab_Slider,
 	Switcher_Row,
 	Toast,
+	Code_Copy,
+	Msg_Action, // Hover-Panel, „Mehr"-Menü, Inline-Editor-Buttons
+	Call,       // Banner, Panel-Buttons, Speaking-Ringe
 	Misc,
 }
 

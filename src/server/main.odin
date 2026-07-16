@@ -108,6 +108,10 @@ disconnect :: proc(c: ^Client_Conn) {
 			break
 		}
 	}
+	if c.authed {
+		// Diese Verbindung hielt womöglich einen Call.
+		call_leave_everywhere(c.user_id, c, 0)
+	}
 	if c.authed && !user_online(c.user_id) {
 		if u := find_user_by_id(c.user_id); u != nil {
 			ev := shared.Wire{kind = shared.EV_USER, user = wire_user(u)} // online=false
@@ -186,6 +190,11 @@ main :: proc() {
 	listener, lerr := net.listen_tcp(net.Endpoint{address = net.IP4_Any, port = port})
 	if lerr != nil {
 		fmt.printfln("[error] listen auf Port %d fehlgeschlagen: %v", port, lerr)
+		os.exit(1)
+	}
+
+	// Voice: UDP-SFU auf demselben Port (eigener Thread).
+	if !call_udp_start(port) {
 		os.exit(1)
 	}
 

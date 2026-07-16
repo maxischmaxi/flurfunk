@@ -22,6 +22,7 @@ Modal_Kind :: enum {
 	Members,
 	Quick_Switch,
 	Confirm_Delete, // Kanal löschen bestätigen (app.confirm_channel)
+	Msg_History,    // Bearbeitungsverlauf einer Nachricht (Sheet von rechts)
 }
 
 // Kontextmenü (Rechtsklick auf einen Kanal in der Sidebar).
@@ -54,8 +55,31 @@ App :: struct {
 	ctx:             Ctx_Menu,
 	confirm_channel: u64,
 
+	// „Mehr"-Menü einer Nachricht (msgmenu.odin)
+	msg_menu: Msg_Menu,
+
+	// Bearbeitungsverlauf (Sheet, sheet.odin); Daten kommen per
+	// message_history-Antwort
+	history_msg_id:   u64,
+	history_loading:  bool,
+	history_versions: [dynamic]shared.Chat_Message,
+	history_scroll:   Scroll,
+
+	// Theme (hell/dunkel)
+	theme_mode: Theme_Mode,
+	theme_menu: bool, // Dropdown in der Titelleiste offen
+	theme_k:    f32,  // 0 = hell, 1 = dunkel; animiert → weiche Überblendung
+
+	// Zuletzt kopierter Code-Block: zeigt dort kurz ein Häkchen statt des
+	// Copy-Icons. Es kann immer nur einer der jüngste sein.
+	copied_id: u64,
+	copied_at: f64,
+
 	// Quick Switcher
 	switcher_sel: int,
+
+	// Aktiver Voice-Call (app-weit höchstens einer, call.odin)
+	call: Client_Call,
 
 	welcome_input: Text_Input,
 	welcome_error: string,
@@ -71,6 +95,13 @@ app_init :: proc(app: ^App) {
 	}
 	app.fonts = fonts_load(g_scale)
 	app.tz, _ = timezone.region_load("local")
+
+	// Theme: gemerkte Wahl, sonst Systemeinstellung. Beim Start ohne
+	// Animation — die Überblendung ist für den Wechsel im Betrieb da.
+	app.theme_mode = theme_mode_from_string(app.cfg.theme)
+	sys_theme_start(app.theme_mode == .System)
+	app.theme_k = theme_target(app)
+	theme_apply(app.theme_k)
 
 	// Alle konfigurierten Server verbinden
 	for s, i in app.cfg.servers {
@@ -105,6 +136,48 @@ app_set_scale :: proc(app: ^App, scale: f32) {
 	app.cfg.ui_scale = g_scale
 	config_save(&app.cfg)
 	toast(app, .Info, fmt.tprintf("Zoom %d %%", int(math.round(g_scale * 100))))
+}
+
+// --- Theme ---
+
+// Soll gerade dunkel dargestellt werden?
+theme_is_dark :: proc(app: ^App) -> bool {
+	switch app.theme_mode {
+	case .Light:
+		return false
+	case .Dark:
+		return true
+	case .System:
+		return sys_theme_is_dark()
+	}
+	return false
+}
+
+@(private = "file")
+theme_target :: proc(app: ^App) -> f32 {
+	return theme_is_dark(app) ? 1 : 0
+}
+
+// Pro Frame vor dem Zeichnen: Überblendung weiterdrehen und die aktiven
+// Farben setzen. Muss vor ClearBackground laufen (main.odin).
+theme_frame :: proc(app: ^App) {
+	target := theme_target(app)
+	app.theme_k = exp_smooth(app.theme_k, target, app.dt, 6)
+	if abs(app.theme_k - target) < 0.001 {
+		app.theme_k = target
+	}
+	theme_apply(app.theme_k)
+}
+
+// Theme umstellen (Dropdown in der Titelleiste) und Wahl merken.
+app_set_theme :: proc(app: ^App, mode: Theme_Mode) {
+	if app.theme_mode == mode {
+		return
+	}
+	app.theme_mode = mode
+	sys_theme_follow(mode == .System) // nur „System" muss dem Desktop folgen
+	app.cfg.theme = theme_mode_to_string(mode)
+	config_save(&app.cfg)
 }
 
 app_active_conn :: proc(app: ^App) -> ^Server_Conn {
@@ -160,6 +233,7 @@ app_poll :: proc(app: ^App) {
 	for c, i in app.conns {
 		app_poll_conn(app, c, i == app.active)
 	}
+	call_tick(app) // Voice: Keepalive/HELLO-Retries, Trennung erkennen
 }
 
 conn_label :: proc(c: ^Server_Conn) -> string {
@@ -257,6 +331,8 @@ app_apply_wire :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, is_active_ser
 	switch w.kind {
 	case shared.EV_MESSAGE:
 		app_add_message(app, c, w.message, is_active_server)
+	case shared.EV_MESSAGE_EDITED:
+		app_apply_edit(c, w.message)
 	case shared.EV_CHANNEL:
 		existed := conn_find_channel(c, w.channel.id) != nil
 		app_upsert_channel(app, c, w.channel)
@@ -277,6 +353,8 @@ app_apply_wire :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, is_active_ser
 	case shared.EV_SERVER:
 		c.server_name = strings.clone(w.server_name)
 		app_sync_config(app, c)
+	case shared.EV_CALL_STATE:
+		app_apply_call_state(app, c, w.channel_id, w.call)
 	}
 }
 
@@ -326,6 +404,10 @@ app_apply_reply :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, p: Pending) 
 	case shared.K_LIST_CHANNELS:
 		for ch in w.channels {
 			app_upsert_channel(app, c, ch)
+		}
+		clear(&c.calls)
+		for info in w.calls {
+			conn_set_call_state(c, info.channel_id, info.peers)
 		}
 		// ersten Channel aktivieren
 		if c.active_channel == 0 {
@@ -388,6 +470,63 @@ app_apply_reply :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, p: Pending) 
 		}
 		app_add_message(app, c, w.message, true)
 
+	case shared.K_EDIT_START:
+		// Der Editor wurde optimistisch geöffnet — lehnt der Server den
+		// Einstieg ab (Frist/Limit), wieder schließen.
+		if !w.ok && c.edit_msg_id == p.message_id {
+			toast(app, .Error, translate_err(w.err))
+			stop_edit(app, c)
+		}
+
+	case shared.K_EDIT_MESSAGE:
+		c.edit_busy = false
+		if !w.ok {
+			toast(app, .Error, fmt.tprintf("Nicht gespeichert: %s", translate_err(w.err)))
+			// Bei endgültigen Fehlern den Editor schließen; sonst bleibt der
+			// getippte Text stehen (Abbrechen geht immer).
+			if w.err == "edit_window" || w.err == "edit_limit" || w.err == "not_found" {
+				if c.edit_msg_id == p.message_id {
+					stop_edit(app, c)
+				}
+			}
+			return
+		}
+		app_apply_edit(c, w.message)
+		if c.edit_msg_id == w.message.id {
+			stop_edit(app, c)
+		}
+
+	case shared.K_CALL_JOIN:
+		app.call.joining = false
+		if !w.ok {
+			toast(app, .Error, fmt.tprintf("Call-Beitritt fehlgeschlagen: %s", translate_err(w.err)))
+			return
+		}
+		call_begin(app, c, w)
+
+	case shared.K_CALL_LEAVE:
+	// lokal längst abgebaut — nichts zu tun
+
+	case shared.K_CALL_MUTE:
+		if !w.ok {
+			toast(app, .Error, translate_err(w.err))
+		}
+
+	case shared.K_MESSAGE_HISTORY:
+		if app.modal != .Msg_History || app.history_msg_id != p.message_id {
+			return
+		}
+		app.history_loading = false
+		if !w.ok {
+			toast(app, .Error, translate_err(w.err))
+			close_modal(app)
+			return
+		}
+		clear(&app.history_versions)
+		for v in w.messages {
+			append(&app.history_versions, v)
+		}
+
 	case shared.K_HISTORY:
 		cs := conn_find_channel(c, w.channel_id != 0 ? w.channel_id : p.channel_id)
 		if cs == nil {
@@ -422,6 +561,30 @@ app_apply_reply :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, p: Pending) 
 			}
 			cs.history_done = len(w.messages) < HISTORY_PAGE
 			cs.adjust_scroll = true
+		}
+	}
+}
+
+// Einen Edit auf die lokale Kopie der Nachricht anwenden (Event oder
+// eigene edit-Antwort). Der Layout-Cache wird invalidiert — die neue
+// Fassung kann anders hoch sein.
+@(private = "file")
+app_apply_edit :: proc(c: ^Server_Conn, m: shared.Chat_Message) {
+	cs := conn_find_channel(c, m.channel_id)
+	if cs == nil {
+		return
+	}
+	for &ex in cs.messages {
+		if ex.id == m.id {
+			ex.text = m.text
+			ex.edited_ms = m.edited_ms
+			ex.edit_count = m.edit_count
+			cs.rows_w = -1
+			// Selektions-Indizes dieser Nachricht sind hinfällig
+			if g_sel.active && g_sel.conn == c && g_sel.channel == m.channel_id {
+				sel_clear()
+			}
+			return
 		}
 	}
 }
@@ -579,11 +742,21 @@ translate_err :: proc(code: string) -> string {
 		return "Nicht angemeldet"
 	case "invalid_request":
 		return "Ungültige Eingabe"
+	case "edit_window":
+		return "Die Bearbeitungsfrist (1 Minute) ist abgelaufen"
+	case "edit_limit":
+		return "Diese Nachricht wurde bereits 3-mal bearbeitet"
 	}
 	return fmt.tprintf("Fehler: %s", code)
 }
 
 // --- Zeit-Formatierung ---
+
+// Unix-Millisekunden „jetzt" (lokale Uhr — Nachrichten-Zeitstempel kommen
+// vom Server; leichte Uhren-Drift betrifft nur die Anzeige).
+unix_now_ms :: proc() -> i64 {
+	return time.to_unix_nanoseconds(time.now()) / 1_000_000
+}
 
 @(private = "file")
 local_datetime :: proc(app: ^App, ts_ms: i64) -> (datetime.DateTime, bool) {
@@ -624,7 +797,7 @@ format_day_label :: proc(app: ^App, ts_ms: i64) -> string {
 	if !ok {
 		return "?"
 	}
-	now_ms := time.to_unix_nanoseconds(time.now()) / 1_000_000
+	now_ms := unix_now_ms()
 	today := day_key(app, now_ms)
 	yesterday := day_key(app, now_ms - 24*60*60*1000)
 	key := i64(dt.year)*10000 + i64(dt.month)*100 + i64(dt.day)

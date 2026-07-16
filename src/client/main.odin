@@ -16,12 +16,14 @@ main :: proc() {
 
 	app: App
 	app_init(&app)
+	defer sys_theme_stop()
 
 	title_unread := -1
 
 	for !rl.WindowShouldClose() {
 		app.dt = min(rl.GetFrameTime(), 1.0/20.0) // Ruckler nicht überspringen lassen
 		app_poll(&app)
+		theme_frame(&app) // Farben für diesen Frame festlegen (vor ClearBackground)
 
 		// Fenstertitel mit Unread-Zähler
 		unread := app_total_unread(&app)

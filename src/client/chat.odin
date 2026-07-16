@@ -6,7 +6,6 @@ package main
 import "core:fmt"
 import "core:math"
 import "core:strings"
-import "core:unicode/utf8"
 
 import rl "vendor:raylib"
 import shared "../shared"
@@ -30,13 +29,17 @@ Msg_Row :: struct {
 
 // --- Layout-Cache ---
 
+// edit_id/edit_h: Nachricht im Inline-Edit (0 = keine) und die Box-Höhe
+// ihres Editors — beides Teil des Cache-Schlüssels, damit Tippen im Editor
+// die Zeilenhöhe sofort nachzieht.
 @(private = "file")
-rows_dirty :: proc(cs: ^Channel_State, text_w: f32) -> bool {
-	return cs.rows_n != len(cs.messages) || cs.rows_w != text_w || cs.rows_divider != cs.divider_id
+rows_dirty :: proc(cs: ^Channel_State, text_w: f32, edit_id: u64, edit_h: f32) -> bool {
+	return cs.rows_n != len(cs.messages) || cs.rows_w != text_w || cs.rows_divider != cs.divider_id ||
+		cs.rows_edit != edit_id || cs.rows_edit_h != edit_h
 }
 
 @(private = "file")
-build_rows :: proc(app: ^App, cs: ^Channel_State, text_w: f32) {
+build_rows :: proc(app: ^App, cs: ^Channel_State, text_w: f32, edit_id: u64, edit_h: f32) {
 	old_h := cs.content_h
 	clear(&cs.rows)
 
@@ -63,14 +66,22 @@ build_rows :: proc(app: ^App, cs: ^Channel_State, text_w: f32) {
 			prev := msgs[i-1]
 			compact = prev.author_id == m.author_id && m.ts_ms - prev.ts_ms < 3*60*1000
 		}
-		th := rich_text_height(&app.fonts, m.text, text_w)
-		h := compact ? th + 6 : th + 34
+		h: f32
+		if edit_id != 0 && m.id == edit_id {
+			// Editor-Box ersetzt den Text (+ etwas Luft unter der Box)
+			h = compact ? edit_h + 10 : edit_h + 38
+		} else {
+			th := rich_text_height(app, m.text, text_w, m.edit_count > 0)
+			h = compact ? th + 6 : th + 34
+		}
 		append(&cs.rows, Msg_Row{kind = .Message, msg_idx = i, compact = compact, h = h})
 	}
 
 	cs.rows_n = len(msgs)
 	cs.rows_w = text_w
 	cs.rows_divider = cs.divider_id
+	cs.rows_edit = edit_id
+	cs.rows_edit_h = edit_h
 	total := f32(10)
 	for r in cs.rows {
 		total += r.h
@@ -97,19 +108,27 @@ draw_chat :: proc(app: ^App, c: ^Server_Conn, chat: rl.Rectangle) {
 		return
 	}
 
-	// „Einfach lostippen" → Fokus aufs Eingabefeld.
+	// „Einfach lostippen" → Fokus aufs Eingabefeld (bzw. den offenen Editor).
 	// Nicht während Tab-Navigation — die parkt den Fokus bewusst auf Buttons.
+	editing_here := c.edit_msg_id != 0 && c.edit_channel == c.active_channel
 	if app.ui.focus == .None && app.modal == .None && !app.ui.tab_nav {
+		app.ui.focus = editing_here ? .Edit : .Message
+	}
+	// Der Editor ist nicht sichtbar (anderer Channel/Server) → Fokus lösen
+	if app.ui.focus == .Edit && !editing_here {
 		app.ui.focus = .Message
 	}
 
 	draw_chat_header(app, c, cs, chat)
 
+	// „Call läuft"-Banner (animiert ein/aus; 0 wenn keiner läuft)
+	banner_h := draw_call_banner(app, c, cs, chat)
+
 	// Eingabefeld unten (Höhe hängt vom Inhalt ab)
 	input_h := draw_message_input(app, c, cs, chat)
 
 	// Nachrichtenliste dazwischen
-	list := rl.Rectangle{chat.x, chat.y + HEADER_H + 1, chat.width, chat.height - HEADER_H - 1 - input_h}
+	list := rl.Rectangle{chat.x, chat.y + HEADER_H + 1 + banner_h, chat.width, chat.height - HEADER_H - 1 - banner_h - input_h}
 	draw_message_list(app, c, cs, list)
 }
 
@@ -117,7 +136,9 @@ draw_chat :: proc(app: ^App, c: ^Server_Conn, chat: rl.Rectangle) {
 draw_chat_empty_state :: proc(app: ^App, chat: rl.Rectangle) {
 	cx := chat.x + chat.width/2
 	cy := chat.y + chat.height/2
-	rl.DrawCircleV({cx, cy - 60}, 36, COL_PANEL_BG)
+	// COL_BORDER_SOFT statt COL_PANEL_BG: im dunklen Theme ist der Panel-Ton
+	// mit der Chatfläche identisch, der Kreis wäre unsichtbar.
+	rl.DrawCircleV({cx, cy - 60}, 36, COL_BORDER_SOFT)
 	draw_rune_centered(app.fonts.bold24, '#', cx, cy - 60, COL_TEXT_FAINT)
 	draw_text_centered(app.fonts.bold18, "Kein Kanal ausgewählt", cx, cy - 4, 18, COL_TEXT)
 	draw_text_centered(app.fonts.regular15, "Wähle links einen Kanal oder starte eine Direktnachricht.",
@@ -136,6 +157,13 @@ draw_chat_header :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, chat: r
 		draw_avatar(app, seed, x, chat.y + (HEADER_H - 28)/2, 28, presence = true, online = online)
 		title := channel_title(c, cs)
 		draw_text(app.fonts.bold18, tcstr(title), {x + 38, chat.y + (HEADER_H - 18)/2}, 18, 0, COL_TEXT)
+		if partner != nil && partner.in_call {
+			// Gegenüber ist gerade in einem Call
+			tw := rl.MeasureTextEx(app.fonts.bold18, tcstr(title), 18, 0).x
+			draw_headphones(x + 38 + tw + 16, chat.y + HEADER_H/2 - 1, 7, 2.2, COL_ONLINE)
+		}
+		cb := rl.Rectangle{chat.x + chat.width - 24 - THEME_RESERVE - 34, chat.y + (HEADER_H - 34)/2, 34, 34}
+		draw_call_header_button(app, c, cs, cb)
 	} else {
 		title := channel_title(c, cs)
 		draw_text(app.fonts.bold18, tcstr(title), {x, chat.y + (HEADER_H - 18)/2}, 18, 0, COL_TEXT)
@@ -149,12 +177,16 @@ draw_chat_header :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, chat: r
 		count_label := fmt.tprintf("%d", n)
 		clw := rl.MeasureTextEx(app.fonts.bold13, tcstr(count_label), 13, 0).x
 		total_w := stack_w + clw + 18
-		r := rl.Rectangle{chat.x + chat.width - total_w - 24, chat.y + (HEADER_H - 34)/2, total_w + 12, 34}
+		// THEME_RESERVE: der Theme-Umschalter sitzt ganz rechts in der Kopfzeile
+		r := rl.Rectangle{
+			chat.x + chat.width - total_w - 24 - THEME_RESERVE,
+			chat.y + (HEADER_H - 34)/2, total_w + 12, 34,
+		}
 
 		hovered := ui_hover(&app.ui, r, .Base)
 		focused := tab_stop(app, anim_id(.Misc, cs.ch.id ~ 0xABCD), r, .Base, radius = 7)
 		t := anim_to(app, anim_id(.Misc, cs.ch.id ~ 0xABCD), (hovered || focused) ? 1 : 0)
-		rrect(r, 7, fade(rl.Color{24, 24, 27, 255}, t*0.06))
+		rrect(r, 7, fade(COL_OVERLAY, t*0.06))
 		if focused {
 			draw_focus_ring(r, 7)
 		}
@@ -178,6 +210,10 @@ draw_chat_header :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, chat: r
 		if ui_click(&app.ui, r, .Base) || (focused && app.ui.tab_activate) {
 			open_modal(app, .Members)
 		}
+
+		// Voice-Call-Button links vom Mitglieder-Stack
+		cb := rl.Rectangle{r.x - 42, chat.y + (HEADER_H - 34)/2, 34, 34}
+		draw_call_header_button(app, c, cs, cb)
 	}
 	rl.DrawLineEx({chat.x, chat.y + HEADER_H}, {chat.x + chat.width, chat.y + HEADER_H}, 1, COL_BORDER_SOFT)
 }
@@ -194,8 +230,13 @@ draw_message_list :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, list: 
 	text_x := list.x + MSG_GUTTER
 	text_w := list.width - MSG_GUTTER - MSG_PAD_RIGHT
 
-	if rows_dirty(cs, text_w) {
-		build_rows(app, cs, text_w)
+	edit_id := c.edit_channel == cs.ch.id ? c.edit_msg_id : 0
+	edit_h := f32(0)
+	if edit_id != 0 {
+		edit_h = edit_box_height(app, c, text_w)
+	}
+	if rows_dirty(cs, text_w, edit_id, edit_h) {
+		build_rows(app, cs, text_w, edit_id, edit_h)
 	}
 
 	if len(cs.messages) == 0 {
@@ -262,7 +303,7 @@ draw_message_list :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, list: 
 	}
 
 	msgs := cs.messages[:]
-	for row in cs.rows {
+	for row, ri in cs.rows {
 		if y > list.y + list.height {
 			break
 		}
@@ -294,10 +335,36 @@ draw_message_list :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, list: 
 
 		case .Message:
 			m := msgs[row.msg_idx]
+			editing := edit_id != 0 && m.id == edit_id
 			row_rect := rl.Rectangle{list.x, y, list.width, row.h}
-			row_hover := ui_hover(&app.ui, row_rect, .Base)
-			if row_hover {
+
+			// Die Panel-Zone der NÄCHSTEN eigenen Nachricht ragt in diese
+			// Zeile hinein und gehört ihr — Hover und Klick dort zählen
+			// nicht für die aktuelle Zeile.
+			steal := false
+			if ri + 1 < len(cs.rows) && cs.rows[ri+1].kind == .Message {
+				nm := msgs[cs.rows[ri+1].msg_idx]
+				if msg_panel_exists(c, nm) {
+					steal = ui_hover(&app.ui, msg_panel_rect(list, y + row.h), .Base)
+				}
+			}
+
+			panel_r := msg_panel_rect(list, y)
+			mine_panel := msg_panel_exists(c, m)
+			menu_here := app.msg_menu.open && app.msg_menu.msg_id == m.id
+			hot := (ui_hover(&app.ui, row_rect, .Base) && !steal) ||
+				(mine_panel && ui_hover(&app.ui, panel_r, .Base)) || menu_here
+			if hot {
 				rl.DrawRectangleRec(row_rect, COL_HOVER_ROW)
+			}
+
+			// Klicks im sichtbaren Panel (eigenes oder das der nächsten
+			// Zeile) dürfen den Inhalt darunter nicht auslösen — z. B. den
+			// Copy-Button eines Code-Blocks.
+			shield := steal || (mine_panel && hot && ui_hover(&app.ui, panel_r, .Base))
+			saved_click := app.ui.clicked
+			if shield {
+				app.ui.clicked = false
 			}
 
 			author_id := m.author_id
@@ -327,23 +394,96 @@ draw_message_list :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, list: 
 						open_dm_with(app, c, author_id)
 					}
 				}
-				rich_text(&app.fonts, m.text, text_x, y + 28, text_w, true)
+				if editing {
+					draw_edit_row(app, c, cs, m, text_x, y + 28, text_w)
+				} else {
+					rs := Rich_Sel{msg = m.id}
+					rich_text(app, m.text, text_x, y + 28, text_w, true, m.id, edited = m.edit_count > 0, sel = &rs)
+				}
 			} else {
 				// Kompaktzeile: Zeit im Gutter nur bei Hover
-				if row_hover {
+				if hot {
 					ts := format_time_hm(app, m.ts_ms)
 					tw := rl.MeasureTextEx(app.fonts.regular13, tcstr(ts), 13, 0).x
 					draw_text(app.fonts.regular13, tcstr(ts), {text_x - tw - 10, y + 6}, 13, 0, COL_TEXT_FAINT)
 				}
-				rich_text(&app.fonts, m.text, text_x, y + 3, text_w, true)
+				if editing {
+					draw_edit_row(app, c, cs, m, text_x, y + 3, text_w)
+				} else {
+					rs := Rich_Sel{msg = m.id}
+					rich_text(app, m.text, text_x, y + 3, text_w, true, m.id, edited = m.edit_count > 0, sel = &rs)
+				}
+			}
+
+			if shield {
+				app.ui.clicked = saved_click
+			}
+			if mine_panel && hot {
+				sel_block(panel_r) // über dem Panel startet kein Text-Drag
+				draw_msg_panel(app, c, cs, m, panel_r)
+			} else if mine_panel {
+				// Einblendung zurücksetzen — sonst erschiene das Panel beim
+				// nächsten Hover schlagartig (der Anim-Wert bliebe auf 1)
+				delete_key(&app.anim.vals, anim_id(.Msg_Action, m.id ~ 0x9A7E))
+				delete_key(&app.anim.vals, anim_id(.Msg_Action, m.id ~ 0x3D07))
 			}
 		}
 		y += row.h
 	}
 	scissor_end()
 
+	// Browser-artige Text-Selektion (Drag, Doppelklick, Highlight)
+	chat_sel_update(app, c, cs, list)
+
 	scrollbar(app, list, cs.content_h, &cs.scroll, .Base)
 	draw_jump_pill(app, cs, list, max_scroll)
+}
+
+// --- Hover-Panel (Aktionen an eigenen Nachrichten, wie bei Slack) ---
+
+MSG_PANEL_BTN :: f32(30)
+
+// Bekommt diese Nachricht ein Aktions-Panel? Nur eigene, und nicht die,
+// die gerade im Inline-Edit steckt.
+@(private = "file")
+msg_panel_exists :: proc(c: ^Server_Conn, m: shared.Chat_Message) -> bool {
+	return m.author_id == c.me.id && m.id != c.edit_msg_id
+}
+
+// Panel-Rechteck einer Zeile mit Oberkante `y`: oben rechts, ragt halb über
+// die Zeilengrenze (deshalb die Besitz-Regeln in draw_message_list).
+@(private = "file")
+msg_panel_rect :: proc(list: rl.Rectangle, y: f32) -> rl.Rectangle {
+	w := MSG_PANEL_BTN + 8 // ein Button; wächst mit künftigen Buttons (Reaktionen …)
+	return {list.x + list.width - w - 20, y - 14, w, MSG_PANEL_BTN + 8}
+}
+
+@(private = "file")
+draw_msg_panel :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, m: shared.Chat_Message, p: rl.Rectangle) {
+	// weich einblenden
+	pt := anim_to(app, anim_id(.Msg_Action, m.id ~ 0x9A7E), 1, 22, initial = 0)
+	draw_shadow(p, 8, 0.35*pt)
+	rrect(p, 8, fade(COL_SURFACE, pt))
+	rrect_lines(p, 8, 1, fade(COL_BORDER, pt))
+
+	// „Mehr"-Button (drei vertikale Punkte) → Popover-Menü
+	btn := rl.Rectangle{p.x + 4, p.y + 4, MSG_PANEL_BTN, MSG_PANEL_BTN}
+	id := anim_id(.Msg_Action, m.id ~ 0x3D07)
+	hovered := ui_hover(&app.ui, btn, .Base)
+	active := app.msg_menu.open && app.msg_menu.msg_id == m.id
+	t := anim_to(app, id, (hovered || active) ? 1 : 0, 18)
+	if t > 0.01 {
+		rrect(btn, 6, fade(COL_OVERLAY, t*0.08))
+	}
+	if hovered {
+		app.ui.cursor = .POINTING_HAND
+	}
+	draw_dots_v(btn.x + btn.width/2, btn.y + btn.height/2, 4.5, 1.6,
+		fade(mix(COL_TEXT_DIM, COL_TEXT, t), pt))
+	tooltip(app, id ~ 0x71C, btn, "Weitere Aktionen", .Base)
+	if ui_click(&app.ui, btn, .Base) {
+		msg_menu_open(app, cs.ch.id, m.id, {btn.x + btn.width/2, p.y + p.height + 2})
+	}
 }
 
 // Ein DM öffnen bzw. aktivieren.
@@ -377,7 +517,7 @@ draw_jump_pill :: proc(app: ^App, cs: ^Channel_State, list: rl.Rectangle, max_sc
 	if focused {
 		draw_focus_ring(r, 16)
 	}
-	draw_text(app.fonts.bold13, tcstr(label), {x + 16, y + (h-13)/2 - 1}, 13, 0, fade(COL_WHITE, t))
+	draw_text(app.fonts.bold13, tcstr(label), {x + 16, y + (h-13)/2 - 1}, 13, 0, fade(COL_PRIMARY_FG, t))
 	if ui_hover(&app.ui, r, .Base) {
 		app.ui.cursor = .POINTING_HAND
 	}
@@ -400,276 +540,41 @@ draw_loading_dots :: proc(app: ^App, cx, cy: f32) {
 
 // --- Eingabefeld ---
 
-// Zeilen-Layout der Plaintext-Eingabe (Wortumbruch, Runen-Indizes).
-Input_Line :: struct {
-	start, end: int, // [start, end) in Runen
-}
-
-@(private = "file")
-g_rune_w: map[rune]f32 // Breiten-Cache (nur Main-Thread)
-
-// Beim Zoom-Wechsel aufrufen — die gemessenen Breiten ändern sich leicht.
-rune_widths_clear :: proc() {
-	clear(&g_rune_w)
-}
-
-@(private = "file")
-rune_width :: proc(app: ^App, r: rune) -> f32 {
-	if w, ok := g_rune_w[r]; ok {
-		return w
-	}
-	s, _ := utf8.runes_to_string([]rune{r}, context.temp_allocator)
-	w := rl.MeasureTextEx(app.fonts.regular17, tcstr(s), 17, 0).x
-	g_rune_w[r] = w
-	return w
-}
-
-@(private = "file")
-layout_input :: proc(app: ^App, runes: []rune, width: f32) -> [dynamic]Input_Line {
-	lines := make([dynamic]Input_Line, context.temp_allocator)
-	start := 0
-	x := f32(0)
-	last_space := -1
-	for i := 0; i < len(runes); i += 1 {
-		r := runes[i]
-		if r == '\n' {
-			append(&lines, Input_Line{start, i})
-			start = i + 1
-			x = 0
-			last_space = -1
-			continue
-		}
-		rw := rune_width(app, r)
-		if x + rw > width && i > start {
-			brk := last_space > start ? last_space : i
-			append(&lines, Input_Line{start, brk})
-			start = brk
-			last_space = -1
-			x = 0
-			for j := start; j < i; j += 1 {
-				x += rune_width(app, runes[j])
-			}
-		}
-		if r == ' ' {
-			last_space = i + 1
-		}
-		x += rw
-	}
-	append(&lines, Input_Line{start, len(runes)})
-	return lines
-}
-
 // Zeichnet das Eingabefeld und gibt die belegte Gesamthöhe (inkl. Ränder) zurück.
 @(private = "file")
 draw_message_input :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, chat: rl.Rectangle) -> f32 {
 	ti := &c.msg_input
 	margin := f32(20)
-	pad := f32(12)
 	send_w := f32(40) // Platz für den Senden-Button rechts
 	box_w := chat.width - 2*margin
-	inner_w := box_w - 2*pad - send_w
 
-	focused := app.ui.focus == .Message && app.ui.layer == .Base
-	submitted := false
-	if focused {
-		submitted = ti_update(app, ti, true)
-	}
-
-	lines := layout_input(app, ti.runes[:], inner_w)
-	n_shown := clamp(len(lines), 1, 6)
-	target_h := max(f32(46), f32(n_shown)*24 + 20)
+	target_h := editor_box_height(app, ti, box_w - 2*EDITOR_PAD - send_w, 6)
 	box_h := anim_to(app, anim_id(.Misc, c.active_channel ~ 0x11), target_h, 20, initial = target_h)
 	hint_h := f32(20)
 	total := box_h + 14 + hint_h + 10
 
 	box := rl.Rectangle{chat.x + margin, chat.y + chat.height - hint_h - 10 - box_h, box_w, box_h}
-	text_area := rl.Rectangle{box.x, box.y, box.width - send_w, box.height}
-	tab_stop(app, anim_id(.Input_Focus, u64(Focus.Message)), box, .Base, .Message, RADIUS_INPUT)
 
-	if ui_hover(&app.ui, text_area, .Base) {
-		app.ui.cursor = .IBEAM
+	ph: string
+	if cs.ch.is_dm {
+		ph = fmt.tprintf("Nachricht an %s", channel_title(c, cs))
+	} else {
+		ph = fmt.tprintf("Nachricht an #%s", cs.ch.name)
 	}
-
-	// Fokus-Ring + Rahmen
-	ft := anim_to(app, anim_id(.Input_Focus, u64(Focus.Message)), focused ? 1 : 0, 18)
-	rrect(box, RADIUS_INPUT, COL_WHITE)
-	if ft > 0.01 {
-		glow := rl.Rectangle{box.x - 3, box.y - 3, box.width + 6, box.height + 6}
-		rrect_lines(glow, RADIUS_INPUT + 3, 3, fade(COL_ACCENT_SOFT, ft))
-	}
-	rrect_lines(box, RADIUS_INPUT, focused ? 1.6 : 1, mix(COL_BORDER, COL_ACCENT, ft))
-
-	// Cursor-Zeile bestimmen (Zeilennavigation + Sichtbarkeit beim Scrollen)
-	caret_line_of :: proc(lines: []Input_Line, cursor: int) -> int {
-		cl := 0
-		for l, i in lines {
-			if cursor >= l.start && cursor <= l.end {
-				cl = i
-			}
-		}
-		return cl
-	}
-	caret_line := caret_line_of(lines[:], ti.cursor)
-
-	// ↑/↓: zwischen den Zeilen navigieren, Shift erweitert die Selektion.
-	// (Alt+↑/↓ bleibt der Channel-Wechsel.)
-	if focused && !alt_down() {
-		move := 0
-		if key_pressed(.UP) {
-			move = -1
-		}
-		if key_pressed(.DOWN) {
-			move = +1
-		}
-		if move != 0 {
-			extend := shift_down()
-			tgt := caret_line + move
-			if tgt < 0 {
-				ti_move(ti, 0, extend)
-			} else if tgt >= len(lines) {
-				ti_move(ti, len(ti.runes), extend)
-			} else {
-				// x-Position des Cursors in der Zielzeile halten („goal column")
-				cx := f32(0)
-				for j := lines[caret_line].start; j < ti.cursor; j += 1 {
-					cx += rune_width(app, ti.runes[j])
-				}
-				l := lines[tgt]
-				idx := l.end
-				x := f32(0)
-				for j := l.start; j < l.end; j += 1 {
-					w := rune_width(app, ti.runes[j])
-					if cx < x + w/2 {
-						idx = j
-						break
-					}
-					x += w
-				}
-				ti_move(ti, idx, extend)
-			}
-			caret_reset(app)
-			caret_line = caret_line_of(lines[:], ti.cursor)
-		}
-	}
-
-	// Scroll-Zustand: Mausrad über dem Feld scrollt; bewegt sich der
-	// Cursor (Tippen, Pfeile, Klick), wird seine Zeile sichtbar gehalten.
-	line_h := f32(24)
-	content_h := f32(len(lines)) * line_h
-	visible_h := box_h - 20
-	max_scroll := max(0, content_h - visible_h)
-	if ti.cursor != c.input_last_cursor || len(ti.runes) != c.input_last_len {
-		c.input_last_cursor = ti.cursor
-		c.input_last_len = len(ti.runes)
-		cy0 := f32(caret_line) * line_h
-		if cy0 < c.input_scroll.target {
-			c.input_scroll.target = cy0
-		} else if cy0 + line_h > c.input_scroll.target + visible_h {
-			c.input_scroll.target = cy0 + line_h - visible_h
-		}
-	}
-	scroll_update(app, &c.input_scroll, ui_hover(&app.ui, text_area, .Base), max_scroll, 48)
-	text_y0 := box.y + 10 - c.input_scroll.pos
-
-	// Maus: Cursor setzen / Selektion ziehen / Doppelklick Wort
-	if app.ui.layer == .Base {
-		mouse_to_index :: proc(app: ^App, lines: []Input_Line, runes: []rune, tx, ty0: f32) -> int {
-			li := clamp(int((app.ui.mouse.y - ty0) / 24), 0, len(lines) - 1)
-			l := lines[li]
-			rel := app.ui.mouse.x - tx
-			// Index innerhalb der Zeile suchen
-			x := f32(0)
-			for j := l.start; j < l.end; j += 1 {
-				w := rune_width(app, runes[j])
-				if rel < x + w/2 {
-					return j
-				}
-				x += w
-			}
-			return l.end
-		}
-		if app.ui.clicked && rl.CheckCollisionPointRec(app.ui.mouse, text_area) {
-			app.ui.focus = .Message
-			idx := mouse_to_index(app, lines[:], ti.runes[:], box.x + pad, text_y0)
-			if app.ui.double_click {
-				ti_select_word(ti, idx)
-			} else {
-				ti_move(ti, idx, shift_down())
-				app.ui.drag_focus = .Message
-			}
-			caret_reset(app)
-		}
-		if app.ui.drag_focus == .Message && app.ui.mouse_down && !app.ui.clicked {
-			idx := mouse_to_index(app, lines[:], ti.runes[:], box.x + pad, text_y0)
-			ti_move(ti, idx, true)
-		}
-	}
-
-	scissor_begin(box.x + 2, box.y + 2, box.width - send_w - 2, box.height - 4)
-
-	if len(ti.runes) == 0 {
-		ph: string
-		if cs.ch.is_dm {
-			ph = fmt.tprintf("Nachricht an %s", channel_title(c, cs))
-		} else {
-			ph = fmt.tprintf("Nachricht an #%s", cs.ch.name)
-		}
-		draw_text(app.fonts.regular17, tcstr(ph), {box.x + pad, text_y0 + 3}, 17, 0, COL_TEXT_FAINT)
-	}
-
-	lo, hi := ti_sel_range(ti)
-	ly := text_y0
-	for l, i in lines {
-		if ly > box.y + box.height {
-			break
-		}
-		if ly + 24 < box.y {
-			ly += 24
-			continue
-		}
-		// Selektion hinterlegen
-		if focused && lo < hi {
-			seg_lo := max(lo, l.start)
-			seg_hi := min(hi, l.end)
-			if seg_lo < seg_hi {
-				x0 := f32(0)
-				for j := l.start; j < seg_lo; j += 1 {
-					x0 += rune_width(app, ti.runes[j])
-				}
-				x1 := x0
-				for j := seg_lo; j < seg_hi; j += 1 {
-					x1 += rune_width(app, ti.runes[j])
-				}
-				rl.DrawRectangleRec({box.x + pad + x0, ly + 1, x1 - x0, 22}, fade(COL_ACCENT, 0.28))
-			}
-		}
-		draw_text(app.fonts.regular17, tcstr(runes_str(ti.runes[l.start:l.end])),
-			{box.x + pad, ly + 3}, 17, 0, COL_TEXT)
-		if focused && caret_visible(app) && i == caret_line {
-			cw := f32(0)
-			for j := l.start; j < ti.cursor; j += 1 {
-				cw += rune_width(app, ti.runes[j])
-			}
-			rl.DrawLineEx({box.x + pad + cw, ly + 2}, {box.x + pad + cw, ly + 22}, 1.4, COL_TEXT)
-		}
-		ly += 24
-	}
-	scissor_end()
-
-	// Scrollbar, sobald der Inhalt höher ist als die Box.
-	// content-Parameter so gewählt, dass max_scroll exakt dem des Feldes entspricht.
-	sb_area := rl.Rectangle{box.x, box.y + 2, box.width - send_w, box.height - 4}
-	scrollbar(app, sb_area, max_scroll + sb_area.height, &c.input_scroll, .Base)
+	submitted := multiline_editor(app, box, ti, &c.input_ed, .Message, ph, send_w)
+	focused := app.ui.focus == .Message && app.ui.layer == .Base
+	// Fokus-Blende nur LESEN — der Editor hat sie diesen Frame schon bewegt
+	ft := app.anim.vals[anim_id(.Input_Focus, u64(Focus.Message))]
 
 	// Senden-Button
 	has_text := len(strings.trim_space(ti_text(ti))) > 0
 	btn := rl.Rectangle{box.x + box.width - 38, box.y + box.height - 38, 30, 30}
 	btn_focused := tab_stop(app, anim_id(.Misc, 0x5E4D), btn, .Base, radius = 6)
 	bt := anim_to(app, anim_id(.Misc, 0x5E4D), has_text ? 1 : 0, 14)
-	bcol := mix(rl.Color{225, 225, 225, 255}, COL_ACCENT, bt)
+	bcol := mix(COL_SEND_IDLE, COL_ACCENT, bt)
 	if ui_hover(&app.ui, btn, .Base) && has_text {
 		app.ui.cursor = .POINTING_HAND
-		bcol = mix(bcol, rl.Color{0, 0, 0, 255}, 0.08)
+		bcol = mix(bcol, COL_PRESS, 0.08)
 	}
 	rrect(btn, 6, bcol)
 	if btn_focused {
@@ -677,7 +582,10 @@ draw_message_input :: proc(app: ^App, c: ^Server_Conn, cs: ^Channel_State, chat:
 	}
 	// Senden-Icon (Dreieck nach rechts; DrawPoly umgeht Winding-Fallen).
 	// +1 px optischer Ausgleich: rechtsweisende Dreiecke wirken sonst linkslastig.
-	rl.DrawPoly({btn.x + btn.width/2 + 1, btn.y + btn.height/2}, 3, 7, 0, COL_WHITE)
+	// Ohne Text gedeckt (auf COL_SEND_IDLE), mit Text weiß auf dem Akzent —
+	// sonst sähe der leere Button im dunklen Theme aktiv aus.
+	rl.DrawPoly({btn.x + btn.width/2 + 1, btn.y + btn.height/2}, 3, 7, 0,
+		mix(COL_TEXT_FAINT, COL_WHITE, bt))
 	if (ui_click(&app.ui, btn, .Base) || (btn_focused && app.ui.tab_activate)) && has_text {
 		submitted = true
 	}

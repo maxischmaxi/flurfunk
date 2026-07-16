@@ -15,7 +15,14 @@ open_modal :: proc(app: ^App, kind: Modal_Kind) {
 	scroll_to(&app.modal_scroll, 0)
 	app.switcher_sel = 0
 	app.anim.vals[anim_id(.Modal_Open, 1)] = 0 // Öffnungs-Animation neu starten
-	app.ui.focus = kind == .Members ? .None : (kind == .Quick_Switch ? .Switcher : .Modal_Input)
+	#partial switch kind {
+	case .Members, .Msg_History:
+		app.ui.focus = .None
+	case .Quick_Switch:
+		app.ui.focus = .Switcher
+	case:
+		app.ui.focus = .Modal_Input
+	}
 	// Öffnungs-Klick konsumieren, sonst schließt ihn die
 	// Klick-außerhalb-Logik noch im selben Frame wieder.
 	app.ui.clicked = false
@@ -34,7 +41,7 @@ close_modal :: proc(app: ^App) {
 @(private = "file")
 modal_frame :: proc(app: ^App, sw, sh, w, h: f32, title: string, top: f32 = -1) -> rl.Rectangle {
 	t := anim_to(app, anim_id(.Modal_Open, 1), 1, 16, initial = 0)
-	rl.DrawRectangleRec({0, 0, sw, sh}, fade(rl.Color{9, 9, 11, 255}, 0.45*t))
+	rl.DrawRectangleRec({0, 0, sw, sh}, fade(COL_SCRIM, t))
 
 	scale := 0.96 + 0.04*t
 	pw := w * scale
@@ -44,7 +51,8 @@ modal_frame :: proc(app: ^App, sw, sh, w, h: f32, title: string, top: f32 = -1) 
 	p := rl.Rectangle{px, py, pw, ph}
 
 	draw_shadow(p, RADIUS_CARD, t)
-	rrect(p, RADIUS_CARD, fade(COL_WHITE, t))
+	rrect(p, RADIUS_CARD, fade(COL_SURFACE, t))
+	rrect_lines(p, RADIUS_CARD, 1, fade(COL_BORDER, t))
 	if title != "" {
 		draw_text(app.fonts.bold18, tcstr(title), {p.x + 24, p.y + 22}, 18, 0, fade(COL_TEXT, t))
 	}
@@ -109,6 +117,9 @@ draw_modals :: proc(app: ^App, c: ^Server_Conn, sw, sh: f32) {
 
 	case .Quick_Switch:
 		draw_quick_switcher(app, c, sw, sh)
+
+	case .Msg_History:
+		draw_history_sheet(app, c, sw, sh)
 
 	case .Confirm_Delete:
 		cs := conn_find_channel(c, app.confirm_channel)
@@ -179,14 +190,20 @@ draw_members_modal :: proc(app: ^App, c: ^Server_Conn, sw, sh: f32) {
 		label := user_label(c, mid)
 		seed := label
 		online := false
+		in_call := false
 		if u := conn_find_user(c, mid); u != nil {
 			seed = u.username
 			online = u.online
+			in_call = u.in_call
 		}
 		draw_avatar(app, seed, p.x + 24, y + 7, 30, presence = true, online = online)
 		name_x := p.x + 66
 		draw_text(app.fonts.regular15, tcstr(label), {name_x, y + 13}, 15, 0, COL_TEXT)
 		nw := rl.MeasureTextEx(app.fonts.regular15, tcstr(label), 15, 0).x
+		if in_call {
+			draw_headphones(name_x + nw + 14, y + 21, 6, 1.8, COL_ONLINE)
+			nw += 22
+		}
 		if mid == cs.ch.creator_id {
 			draw_text(app.fonts.regular13, "Ersteller", {name_x + nw + 8, y + 15}, 13, 0, COL_TEXT_FAINT)
 		} else if mid == c.me.id {

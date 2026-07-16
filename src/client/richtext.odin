@@ -17,6 +17,17 @@ Span :: struct {
 	code:   bool,
 }
 
+// Kontext für die Chat-Selektion (chatsel.odin). `doc` ist der laufende
+// Runen-Index im Render-Dokument der Nachricht — die Zählung läuft in
+// Zeichnen-, Mess- und Collect-Modus durch DENSELBEN Code, deshalb sind
+// die Indizes garantiert konsistent. Mit gesetztem `collect` wird nur der
+// sichtbare Text eingesammelt (Grundlage fürs Kopieren).
+Rich_Sel :: struct {
+	msg:     u64,
+	doc:     int,
+	collect: ^strings.Builder,
+}
+
 RICH_SIZE :: 17
 RICH_LINE_H :: 24
 CODE_SIZE :: 15     // Inline-Code etwas kleiner als der Fließtext (~0.875em)
@@ -141,10 +152,12 @@ span_size :: proc(s: Span) -> f32 {
 // Ein Text-Fragment zeichnen (inkl. Code-Hintergrund und Durchstreichung).
 // w ist die reine Textbreite; lead/trail sind Chip-Innenabstände am Anfang
 // bzw. Ende eines Code-Spans (0 bei Fortsetzungs-Fragmenten).
+// hl_lo/hl_hi: markierter Runen-Bereich der Chat-Selektion (-1 = keiner).
 @(private = "file")
-draw_fragment :: proc(fonts: ^Fonts, s: Span, text: string, x, y, w, lead, trail: f32) {
+draw_fragment :: proc(fonts: ^Fonts, s: Span, text: string, x, y, w, lead, trail: f32, hl_lo := -1, hl_hi := -1) {
 	ctext := strings.clone_to_cstring(text, context.temp_allocator)
 	font := span_font(fonts, s)
+	size := span_size(s)
 	if s.code {
 		bg := rl.Rectangle{x, y + 2, lead + w + trail, RICH_LINE_H - 4}
 		rrect(bg, CODE_RADIUS, CODE_BG)
@@ -157,6 +170,14 @@ draw_fragment :: proc(fonts: ^Fonts, s: Span, text: string, x, y, w, lead, trail
 		if trail == 0 {
 			rl.DrawRectangleRec({bg.x + bg.width - edge, bg.y, edge, bg.height}, CODE_BG)
 		}
+	}
+	if hl_lo >= 0 {
+		x0 := rl.MeasureTextEx(font, tcstr(rune_slice(text, 0, hl_lo)), size, 0).x
+		x1 := hl_hi >= utf8.rune_count_in_string(text) ? w :
+			rl.MeasureTextEx(font, tcstr(rune_slice(text, 0, hl_hi)), size, 0).x
+		rl.DrawRectangleRec({x + lead + x0, y + 2, x1 - x0, RICH_LINE_H - 4}, fade(COL_ACCENT, 0.30))
+	}
+	if s.code {
 		draw_text(font, ctext, {x + lead, y + (RICH_LINE_H - CODE_SIZE)/2}, CODE_SIZE, 0, CODE_TEXT)
 	} else {
 		draw_text(font, ctext, {x, y + 3}, RICH_SIZE, 0, COL_TEXT)
@@ -172,18 +193,45 @@ draw_fragment :: proc(fonts: ^Fonts, s: Span, text: string, x, y, w, lead, trail
 CODE_BLOCK_PAD :: f32(12)
 CODE_LINE_H :: f32(20)
 CODE_BLOCK_MARGIN :: f32(4) // Abstand über/unter dem Block
+CODE_HEAD_H :: f32(26)      // Kopfleiste: Sprach-Label + Copy-Button
+CODE_BTN :: f32(20)
+COPY_FEEDBACK :: f64(1.4)   // so lange zeigt der Button ein Häkchen
 
 // Ein Segment einer Nachricht: Fließtext oder Code-Block.
 Msg_Block :: struct {
 	is_code: bool,
 	lang:    string, // roher Tag hinter ```
-	body:    string,
+	body:    string, // dargestellt (Tabs expandiert)
+	raw:     string, // wie getippt — das landet in der Zwischenablage
 }
 
+// Tabs spaltenrichtig zu Spaces expandieren (Tabstop 4) — nur fürs
+// Rendern; raylib kann \t nicht zeichnen, und nur mit Spaltenbezug
+// stimmt gemischte Einrückung („ab\tcd") in Mono-Blöcken überein.
 @(private = "file")
 expand_tabs :: proc(s: string) -> string {
-	out, _ := strings.replace_all(s, "\t", "    ", context.temp_allocator)
-	return out
+	if !strings.contains_rune(s, '\t') {
+		return s
+	}
+	sb := strings.builder_make(context.temp_allocator)
+	col := 0
+	for r in s {
+		switch r {
+		case '\n':
+			strings.write_rune(&sb, r)
+			col = 0
+		case '\t':
+			n := 4 - col % 4
+			for _ in 0 ..< n {
+				strings.write_byte(&sb, ' ')
+			}
+			col += n
+		case:
+			strings.write_rune(&sb, r)
+			col += 1
+		}
+	}
+	return strings.to_string(sb)
 }
 
 // Nachricht in Text- und Code-Segmente zerlegen (temp-alloziert).
@@ -197,7 +245,9 @@ split_blocks :: proc(text: string) -> []Msg_Block {
 		if len(cur) == 0 {
 			return
 		}
-		append(blocks, Msg_Block{body = strings.join(cur[:], "\n", context.temp_allocator)})
+		// Auch Fließtext-Tabs expandieren — raylib würde sie als „?" malen.
+		body := expand_tabs(strings.join(cur[:], "\n", context.temp_allocator))
+		append(blocks, Msg_Block{body = body})
 		clear(cur)
 	}
 
@@ -209,8 +259,8 @@ split_blocks :: proc(text: string) -> []Msg_Block {
 			// Einzeiler ```code``` → Block ohne Sprach-Tag
 			if strings.has_suffix(tag, "```") && len(tag) > 3 {
 				flush_text(&blocks, &cur)
-				body := strings.trim_space(tag[:len(tag)-3])
-				append(&blocks, Msg_Block{is_code = true, body = expand_tabs(body)})
+				raw := strings.trim_space(tag[:len(tag)-3])
+				append(&blocks, Msg_Block{is_code = true, body = expand_tabs(raw), raw = raw})
 				i += 1
 				continue
 			}
@@ -226,8 +276,8 @@ split_blocks :: proc(text: string) -> []Msg_Block {
 				append(&code, lines[j])
 				j += 1
 			}
-			body := expand_tabs(strings.join(code[:], "\n", context.temp_allocator))
-			append(&blocks, Msg_Block{is_code = true, lang = tag, body = body})
+			raw := strings.join(code[:], "\n", context.temp_allocator)
+			append(&blocks, Msg_Block{is_code = true, lang = tag, body = expand_tabs(raw), raw = raw})
 			i = closed ? j + 1 : j
 			continue
 		}
@@ -248,11 +298,50 @@ code_visual_lines :: proc(line: string, cols: int) -> int {
 	return (n + cols - 1) / cols
 }
 
+// Copy-Button in der Kopfleiste: legt den Code des Blocks in die
+// Zwischenablage und zeigt danach kurz ein Häkchen.
+@(private = "file")
+code_copy_button :: proc(app: ^App, r: rl.Rectangle, code: string, id: u64, layer: UI_Layer) {
+	hovered := ui_hover(&app.ui, r, layer)
+	focused := tab_stop(app, id, r, layer, radius = 5)
+	copied := app.copied_id == id && rl.GetTime() - app.copied_at < COPY_FEEDBACK
+
+	t := anim_to(app, id, (hovered || focused) ? 1 : 0, 18)
+	// Fläche unter dem Icon — COL_OVERLAY kippt mit dem Theme, tönt also
+	// im Hellen ab und im Dunklen auf. draw_copy_icon stanzt damit aus.
+	chip := mix(CODE_BLOCK_BG, COL_OVERLAY, t*0.09)
+	if t > 0.01 {
+		rrect(r, 5, chip)
+	}
+	if focused {
+		draw_focus_ring(r, 5)
+	}
+	if hovered {
+		app.ui.cursor = .POINTING_HAND
+	}
+
+	cx := r.x + r.width/2
+	cy := r.y + r.height/2
+	if copied {
+		draw_check(cx, cy, 10, 1.7, COL_ONLINE)
+	} else {
+		draw_copy_icon(cx, cy, 11, 1.3, mix(SYN_COMMENT, SYN_TEXT, t), chip)
+	}
+	tooltip(app, id ~ 0xC0FFEE, r, copied ? "Kopiert!" : "Code kopieren", layer)
+
+	if ui_click(&app.ui, r, layer) || (focused && app.ui.tab_activate) {
+		rl.SetClipboardText(tcstr(code))
+		app.copied_id = id
+		app.copied_at = rl.GetTime()
+	}
+}
+
 // Code-Block zeichnen bzw. messen. Gibt die belegte Höhe (inkl. Margins)
 // zurück. Harter Zeichenumbruch: Mono-Advance ist konstant, dadurch sind
 // Messung und Zeichnung deterministisch identisch.
 @(private = "file")
-code_block :: proc(fonts: ^Fonts, b: Msg_Block, x, y, w: f32, draw: bool) -> f32 {
+code_block :: proc(app: ^App, b: Msg_Block, x, y, w: f32, draw: bool, id: u64, layer: UI_Layer, sel: ^Rich_Sel = nil) -> f32 {
+	fonts := &app.fonts
 	lang := lang_lookup(b.lang)
 	adv := rl.MeasureTextEx(fonts.mono15, "M", 15, 0).x
 	cols := max(8, int((w - 2*CODE_BLOCK_PAD) / adv))
@@ -263,27 +352,40 @@ code_block :: proc(fonts: ^Fonts, b: Msg_Block, x, y, w: f32, draw: bool) -> f32
 		total += code_visual_lines(l, cols)
 	}
 
+	// Die Kopfleiste gibt es jetzt immer — der Copy-Button gehört an jeden
+	// Block, auch an einen ohne Sprach-Tag.
 	label := lang != nil ? lang.label : strings.trim_space(b.lang)
-	head := label != "" ? f32(26) : f32(0)
-	pad_top := head > 0 ? head + 8 : CODE_BLOCK_PAD
+	head := CODE_HEAD_H
+	pad_top := head + 8
 	h := f32(total)*CODE_LINE_H + pad_top + CODE_BLOCK_PAD
 
 	if draw {
 		r := rl.Rectangle{x, y + CODE_BLOCK_MARGIN, w, h}
 		rrect(r, 8, CODE_BLOCK_BG)
-		if head > 0 {
-			lw := rl.MeasureTextEx(fonts.regular13, tcstr(label), 13, 0).x
-			draw_text(fonts.regular13, tcstr(label), {r.x + r.width - lw - 12, r.y + 7}, 13, 0, SYN_COMMENT)
-			rl.DrawLineEx({r.x + 1, r.y + head}, {r.x + r.width - 1, r.y + head}, 1, CODE_BLOCK_HEAD)
+		// Im hellen Theme ist die Blockfläche nur leicht getönt — erst der
+		// Rahmen grenzt sie sauber vom Chat ab.
+		rrect_lines(r, 8, 1, CODE_BLOCK_BORDER)
+		// Kopfleiste: Copy-Button ganz rechts, Sprach-Label links davon
+		btn := rl.Rectangle{
+			r.x + r.width - 6 - CODE_BTN, r.y + (head - CODE_BTN)/2,
+			CODE_BTN, CODE_BTN,
 		}
+		code_copy_button(app, btn, b.raw, id, layer)
+		if label != "" {
+			lw := rl.MeasureTextEx(fonts.regular13, tcstr(label), 13, 0).x
+			draw_text(fonts.regular13, tcstr(label), {btn.x - lw - 8, r.y + 7}, 13, 0, SYN_COMMENT)
+		}
+		rl.DrawLineEx({r.x + 1, r.y + head}, {r.x + r.width - 1, r.y + head}, 1, CODE_BLOCK_HEAD)
 
 		hl := Highlighter{lang = lang}
 		x0 := r.x + CODE_BLOCK_PAD
 		yy := r.y + pad_top
+		line_doc := sel != nil ? sel.doc : 0 // Doc-Index des Zeilenanfangs
 		for l in lines {
 			n := code_visual_lines(l, cols)
 			tokens := highlight_line(&hl, l)
 			col := 0
+			lpos := 0 // Runen seit Zeilenanfang (monoton, unabhängig vom Wrap)
 			ty := yy
 			for tok in tokens {
 				color := syn_color(tok.kind)
@@ -307,11 +409,32 @@ code_block :: proc(fonts: ^Fonts, b: Msg_Block, x, y, w: f32, draw: bool) -> f32
 					}
 					seg := rest[:end]
 					rest = rest[end:]
-					draw_text(fonts.mono15, tcstr(seg), {x0 + f32(col)*adv, ty + 2}, 15, 0, color)
+					seg_r := rl.Rectangle{x0 + f32(col)*adv, ty, f32(count)*adv, CODE_LINE_H}
+					if sel != nil && sel.collect == nil {
+						sel_register(sel.msg, line_doc + lpos, seg, seg_r, fonts.mono15, 15, true)
+						if slo, shi := sel_overlap(sel.msg, line_doc + lpos, count); slo >= 0 {
+							rl.DrawRectangleRec({seg_r.x + f32(slo)*adv, seg_r.y, f32(shi - slo)*adv, seg_r.height},
+								fade(COL_ACCENT, 0.30))
+						}
+					}
+					draw_text(fonts.mono15, tcstr(seg), {seg_r.x, ty + 2}, 15, 0, color)
 					col += count
+					lpos += count
 				}
 			}
 			yy += f32(n) * CODE_LINE_H
+			line_doc += utf8.rune_count_in_string(l) + 1
+		}
+	}
+	// Doc-Zählung/Collect zentral — läuft in JEDEM Modus (zeichnen, messen,
+	// einsammeln) identisch, damit die Selektions-Indizes stabil sind.
+	if sel != nil {
+		for l in lines {
+			if sel.collect != nil {
+				strings.write_string(sel.collect, l)
+				strings.write_byte(sel.collect, '\n')
+			}
+			sel.doc += utf8.rune_count_in_string(l) + 1
 		}
 	}
 	return h + 2*CODE_BLOCK_MARGIN
@@ -320,31 +443,78 @@ code_block :: proc(fonts: ^Fonts, b: Msg_Block, x, y, w: f32, draw: bool) -> f32
 // Rich-Text mit Wortumbruch zeichnen bzw. nur messen (draw=false).
 // Gibt die benötigte Höhe zurück. Zerlegt die Nachricht in Fließtext-
 // Segmente und ```-Code-Blöcke.
-rich_text :: proc(fonts: ^Fonts, text: string, x, y, max_width: f32, draw: bool) -> f32 {
+//
+// `id_base` (die Nachrichten-ID) macht die Copy-Buttons pro Code-Block
+// eindeutig und über Frames hinweg stabil — nötig, weil die Zeilen beim
+// Scrollen wandern. Beim Messen (draw=false) ist sie egal. `layer` ist der
+// Eingabe-Layer der Copy-Buttons (im History-Sheet: .Modal).
+// `edited` hängt ein kleines „(bearbeitet)"-Badge an — hinter die letzte
+// Textzeile, wenn es dort noch passt, sonst auf eine eigene Zeile.
+rich_text :: proc(
+	app: ^App,
+	text: string,
+	x, y, max_width: f32,
+	draw: bool,
+	id_base: u64 = 0,
+	layer := UI_Layer.Base,
+	edited := false,
+	sel: ^Rich_Sel = nil,
+) -> f32 {
 	cy := y
+	block_i := 0
+	last_end_x := f32(-1) // Ende der letzten Textzeile (-1 = Code-Block/nichts)
 	for b in split_blocks(text) {
 		if b.is_code {
-			cy += code_block(fonts, b, x, cy, max_width, draw)
+			id := anim_id(.Code_Copy, id_base ~ (u64(block_i) << 32))
+			cy += code_block(app, b, x, cy, max_width, draw, id, layer, sel)
+			block_i += 1
+			last_end_x = -1
 		} else {
-			cy += rich_text_spans(fonts, b.body, x, cy, max_width, draw)
+			h, end_x := rich_text_spans(&app.fonts, b.body, x, cy, max_width, draw, sel)
+			cy += h
+			last_end_x = end_x
 		}
 	}
 	if cy == y {
 		cy += RICH_LINE_H // leere Nachricht
 	}
+	if edited {
+		lbl :: "(bearbeitet)"
+		bw := rl.MeasureTextEx(app.fonts.regular13, lbl, 13, 0).x
+		if last_end_x >= 0 && last_end_x + 6 + bw <= x + max_width {
+			if draw {
+				draw_text(app.fonts.regular13, lbl, {last_end_x + 6, cy - RICH_LINE_H + 6}, 13, 0, COL_TEXT_FAINT)
+			}
+		} else {
+			// nach einem Code-Block (oder zu voller Zeile): eigene Zeile
+			if draw {
+				draw_text(app.fonts.regular13, lbl, {x, cy + 2}, 13, 0, COL_TEXT_FAINT)
+			}
+			cy += 20
+		}
+	}
 	return cy - y
 }
 
-// Fließtext-Segment (Slack-Markdown) zeichnen bzw. messen.
+// Fließtext-Segment (Slack-Markdown) zeichnen bzw. messen. Gibt neben der
+// Höhe auch das x-Ende der letzten Zeile zurück (fürs „bearbeitet"-Badge).
 @(private = "file")
-rich_text_spans :: proc(fonts: ^Fonts, text: string, x, y, max_width: f32, draw: bool) -> f32 {
+rich_text_spans :: proc(fonts: ^Fonts, text: string, x, y, max_width: f32, draw: bool, sel: ^Rich_Sel = nil) -> (f32, f32) {
 	cy := y
+	end_x := x
 	it := text
 	for line in strings.split_lines_iterator(&it) {
 		spans := parse_spans(line)
 		cx := x
 		if len(spans) == 0 {
 			cy += RICH_LINE_H // Leerzeile
+			end_x = x
+			if sel != nil {
+				if sel.collect != nil {
+					strings.write_byte(sel.collect, '\n')
+				}
+				sel.doc += 1
+			}
 			continue
 		}
 		for s in spans {
@@ -378,18 +548,37 @@ rich_text_spans :: proc(fonts: ^Fonts, text: string, x, y, max_width: f32, draw:
 					cx = x
 					cy += RICH_LINE_H
 				}
+				wn := utf8.rune_count_in_string(word)
 				if draw {
-					draw_fragment(fonts, s, word, cx, cy, ww, lead, trail)
+					hl_lo, hl_hi := -1, -1
+					if sel != nil && sel.collect == nil {
+						sel_register(sel.msg, sel.doc, word, {cx + lead, cy, ww, RICH_LINE_H}, font, size, false)
+						hl_lo, hl_hi = sel_overlap(sel.msg, sel.doc, wn)
+					}
+					draw_fragment(fonts, s, word, cx, cy, ww, lead, trail, hl_lo, hl_hi)
+				}
+				if sel != nil {
+					if sel.collect != nil {
+						strings.write_string(sel.collect, word)
+					}
+					sel.doc += wn
 				}
 				cx += lead + ww + trail
 				first = false
 			}
 		}
 		cy += RICH_LINE_H
+		end_x = cx
+		if sel != nil {
+			if sel.collect != nil {
+				strings.write_byte(sel.collect, '\n')
+			}
+			sel.doc += 1
+		}
 	}
-	return cy - y
+	return cy - y, end_x
 }
 
-rich_text_height :: proc(fonts: ^Fonts, text: string, max_width: f32) -> f32 {
-	return rich_text(fonts, text, 0, 0, max_width, false)
+rich_text_height :: proc(app: ^App, text: string, max_width: f32, edited := false) -> f32 {
+	return rich_text(app, text, 0, 0, max_width, false, edited = edited)
 }

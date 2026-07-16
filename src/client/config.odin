@@ -20,6 +20,7 @@ Config_Server :: struct {
 Config :: struct {
 	device_key: string                  `json:"device_key"`, // hex(32B X25519-Private)
 	ui_scale:   f32                     `json:"ui_scale,omitempty"`, // UI-Zoom (Strg +/-), 0 = Standard
+	theme:      string                  `json:"theme,omitempty"`, // "system" (Default) | "light" | "dark"
 	servers:    [dynamic]Config_Server `json:"servers"`,
 }
 

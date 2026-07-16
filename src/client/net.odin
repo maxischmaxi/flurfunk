@@ -47,6 +47,8 @@ Channel_State :: struct {
 	rows_w:        f32,
 	rows_n:        int,
 	rows_divider:  u64,
+	rows_edit:     u64, // Nachricht im Inline-Edit (Teil des Cache-Schlüssels)
+	rows_edit_h:   f32, // Editor-Box-Höhe beim letzten Aufbau
 	content_h:     f32,
 	adjust_scroll: bool, // nach History-Prepend Scroll-Position erhalten
 }
@@ -56,6 +58,7 @@ Pending :: struct {
 	kind:       string,
 	channel_id: u64,
 	user_id:    u64,
+	message_id: u64, // bei edit_*/message_history: betroffene Nachricht
 	before_id:  u64, // bei history: Paging-Anker (0 = initiale Ladung)
 }
 
@@ -92,6 +95,7 @@ Server_Conn :: struct {
 	active_channel: u64, // Channel-ID, 0 = keiner
 	synced:         bool, // list_users/list_channels nach Ready gesendet?
 	sidebar_scroll: Scroll,
+	calls:          map[u64][]shared.Call_Peer, // laufende Calls (channel_id → Teilnehmer)
 
 	// Reconnect-Verwaltung (Main-Thread)
 	prev_phase:  Conn_Phase,
@@ -109,11 +113,14 @@ Server_Conn :: struct {
 	setup_input:   Text_Input,
 	setup_error:   string,
 	msg_input:     Text_Input,
+	input_ed:      Editor_State, // Scroll/Caret-Zustand des Eingabefelds
 
-	// Eingabefeld-Scroll (Inhalt höher als die Box → Scrollbar + Mausrad)
-	input_scroll:      Scroll,
-	input_last_cursor: int, // Cursor-Bewegung erkennen → Caret sichtbar halten
-	input_last_len:    int,
+	// Inline-Edit einer Nachricht (0 = keiner aktiv)
+	edit_msg_id:  u64,
+	edit_channel: u64,
+	edit_input:   Text_Input,
+	edit_ed:      Editor_State,
+	edit_busy:    bool, // Commit unterwegs
 
 	device_key: ^DeviceKey,
 }
@@ -148,11 +155,18 @@ conn_start :: proc(c: ^Server_Conn) {
 	clear(&c.pending)
 	clear(&c.users)
 	clear(&c.channels)
+	clear(&c.calls)
 	c.active_channel = 0
 	c.synced = false
 	c.auth_error = ""
 	c.auth_busy = false
 	c.setup_error = ""
+
+	// Ein offener Inline-Edit überlebt den Reconnect nicht (Channels sind weg)
+	c.edit_msg_id = 0
+	c.edit_channel = 0
+	c.edit_busy = false
+	ti_clear(&c.edit_input)
 
 	thread.run_with_poly_data2(c, gen, conn_worker)
 }

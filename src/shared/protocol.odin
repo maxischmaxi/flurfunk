@@ -26,18 +26,40 @@ K_OPEN_DM        :: "open_dm"
 K_SEND           :: "send"
 K_HISTORY        :: "history"
 
+// Nachricht bearbeiten. Die 1-Minuten-Frist gilt für den EINSTIEG in den
+// Bearbeitungsmodus (edit_start) — danach darf beliebig lange getippt
+// werden. edit_start reserviert die Freigabe serverseitig; edit_message
+// verbraucht sie, edit_cancel gibt sie wieder her. Jeder Edit startet die
+// Frist neu, maximal MAX_MESSAGE_EDITS Edits pro Nachricht.
+K_EDIT_START      :: "edit_start"
+K_EDIT_CANCEL     :: "edit_cancel"
+K_EDIT_MESSAGE    :: "edit_message"
+K_MESSAGE_HISTORY :: "message_history" // alle Versionen einer Nachricht
+
+// Voice-Calls. Ein Channel (oder DM) hat höchstens EINEN laufenden Call;
+// call_join startet ihn implizit, das letzte call_leave beendet ihn.
+// Die Signalisierung läuft über TCP, das Audio über UDP (siehe voice.odin) —
+// call_join liefert dafür call_key, udp_token, ssrc und udp_port.
+K_CALL_JOIN  :: "call_join"
+K_CALL_LEAVE :: "call_leave"
+K_CALL_MUTE  :: "call_mute" // muted-Flag setzen (nur Anzeige für andere)
+
 // Server -> Client Events (seq == 0)
 EV_MESSAGE         :: "ev_message"         // neue Chat-Nachricht
+EV_MESSAGE_EDITED  :: "ev_message_edited"  // Nachricht wurde bearbeitet (message = neuer Stand)
 EV_CHANNEL         :: "ev_channel"         // Channel neu/aktualisiert (Mitgliedschaft)
 EV_CHANNEL_REMOVED :: "ev_channel_removed" // aus Channel entfernt / Channel weg (err = "deleted" bei Löschung)
 EV_USER            :: "ev_user"            // User neu/aktualisiert (inkl. online)
 EV_SERVER          :: "ev_server"          // Server-Konfiguration geändert (Name)
+EV_CALL_STATE      :: "ev_call_state"      // Call-Stand eines Channels (peers leer = beendet)
 
 MAX_MESSAGE_TEXT_LEN :: 8 * 1024
 MAX_USERNAME_LEN     :: 32
 MAX_CHANNEL_NAME_LEN :: 48
 MIN_PASSWORD_LEN     :: 6
 HISTORY_MAX_LIMIT    :: 100
+EDIT_WINDOW_MS       :: 60 * 1000
+MAX_MESSAGE_EDITS    :: 3
 
 User :: struct {
 	id:           u64    `json:"id"`,
@@ -45,6 +67,19 @@ User :: struct {
 	display_name: string `json:"display_name,omitempty"`,
 	is_admin:     bool   `json:"is_admin,omitempty"`,
 	online:       bool   `json:"online,omitempty"`,
+	in_call:      bool   `json:"in_call,omitempty"`, // Headphone-Anzeige
+}
+
+// Teilnehmer eines laufenden Calls.
+Call_Peer :: struct {
+	user_id: u64  `json:"user_id"`,
+	ssrc:    u32  `json:"ssrc"`,
+	muted:   bool `json:"muted,omitempty"`,
+}
+
+Call_Info :: struct {
+	channel_id: u64         `json:"channel_id"`,
+	peers:      []Call_Peer `json:"peers,omitempty"`,
 }
 
 Channel :: struct {
@@ -61,6 +96,8 @@ Chat_Message :: struct {
 	author_id:  u64    `json:"author_id"`,
 	ts_ms:      i64    `json:"ts_ms"`, // Unix-Millisekunden
 	text:       string `json:"text"`,
+	edited_ms:  i64    `json:"edited_ms,omitempty"`,  // letzter Edit (0 = nie bearbeitet)
+	edit_count: int    `json:"edit_count,omitempty"`, // wie oft bearbeitet (max. MAX_MESSAGE_EDITS)
 }
 
 // Ein flacher Envelope für alle Nachrichten-Kinds. Nicht gesetzte Felder
@@ -94,10 +131,21 @@ Wire :: struct {
 	// Parameter
 	channel_id: u64    `json:"channel_id,omitempty"`,
 	user_id:    u64    `json:"user_id,omitempty"`,
+	message_id: u64    `json:"message_id,omitempty"`,
 	name:       string `json:"name,omitempty"`,
 	text:       string `json:"text,omitempty"`,
 	before_id:  u64    `json:"before_id,omitempty"`,
 	limit:      int    `json:"limit,omitempty"`,
+
+	// Voice-Calls
+	call:      Call_Info   `json:"call,omitempty"`,      // EV_CALL_STATE / call_join-Reply
+	calls:     []Call_Info `json:"calls,omitempty"`,     // laufende Calls (list_channels-Reply)
+	call_id:   u64         `json:"call_id,omitempty"`,   // für das UDP-HELLO
+	call_key:  string      `json:"call_key,omitempty"`,  // hex(32 Byte), nur call_join-Reply
+	udp_token: string      `json:"udp_token,omitempty"`, // hex(16 Byte), nur call_join-Reply
+	udp_port:  int         `json:"udp_port,omitempty"`,
+	ssrc:      u32         `json:"ssrc,omitempty"`,
+	muted:     bool        `json:"muted,omitempty"`,
 }
 
 // Antwort-Helfer

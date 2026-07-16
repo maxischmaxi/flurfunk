@@ -69,7 +69,7 @@ draw_ctx_menu :: proc(app: ^App, c: ^Server_Conn, sw, sh: f32) {
 
 	t := anim_to(app, anim_id(.Modal_Open, 2), 1, 24, initial = 0)
 	draw_shadow(p, 10, 0.5*t)
-	rrect(p, 10, fade(COL_WHITE, t))
+	rrect(p, 10, fade(COL_SURFACE, t))
 	rrect_lines(p, 10, 1, fade(COL_BORDER, t))
 
 	iy := y + 6
@@ -83,7 +83,7 @@ draw_ctx_menu :: proc(app: ^App, c: ^Server_Conn, sw, sh: f32) {
 		r := rl.Rectangle{x + 6, iy, CTX_W - 12, CTX_ITEM_H}
 		hovered := ui_hover(&app.ui, r, .Modal)
 		if hovered {
-			rrect(r, 6, it.danger ? fade(COL_RED, 0.08) : COL_RAIL_BG)
+			rrect(r, 6, it.danger ? fade(COL_RED, 0.12) : COL_SIDEBAR_HOVER)
 			app.ui.cursor = .POINTING_HAND
 		}
 		col := it.danger ? COL_RED : COL_TEXT

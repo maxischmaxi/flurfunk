@@ -79,6 +79,20 @@ handle_wire :: proc(c: ^Client_Conn, w: shared.Wire) {
 			handle_send(c, w)
 		case shared.K_HISTORY:
 			handle_history(c, w)
+		case shared.K_EDIT_START:
+			handle_edit_start(c, w)
+		case shared.K_EDIT_CANCEL:
+			handle_edit_cancel(c, w)
+		case shared.K_EDIT_MESSAGE:
+			handle_edit_message(c, w)
+		case shared.K_MESSAGE_HISTORY:
+			handle_message_history(c, w)
+		case shared.K_CALL_JOIN:
+			handle_call_join(c, w)
+		case shared.K_CALL_LEAVE:
+			handle_call_leave(c, w)
+		case shared.K_CALL_MUTE:
+			handle_call_mute(c, w)
 		case:
 			send_err(c, w.kind, w.seq, "invalid_request")
 		}
@@ -232,6 +246,7 @@ handle_list_channels :: proc(c: ^Client_Conn, w: shared.Wire) {
 	}
 	resp := shared.wire_ok(w.kind, w.seq)
 	resp.channels = channels[:]
+	resp.calls = calls_for_user(c.user_id) // laufende Calls für Banner nach Login
 	send_to(c, resp)
 }
 
@@ -515,5 +530,132 @@ handle_history :: proc(c: ^Client_Conn, w: shared.Wire) {
 	resp := shared.wire_ok(w.kind, w.seq)
 	resp.messages = load_history(ch, w.before_id, limit)
 	resp.channel_id = ch.id
+	send_to(c, resp)
+}
+
+// ---------- Nachrichten bearbeiten ----------
+
+// Channel + Mitgliedschaft prüfen (gemeinsamer Vorspann der Edit-Handler).
+@(private = "file")
+edit_channel_of :: proc(c: ^Client_Conn, w: shared.Wire) -> ^Channel {
+	ch := find_channel(w.channel_id)
+	if ch == nil {
+		send_err(c, w.kind, w.seq, "not_found")
+		return nil
+	}
+	if !is_member(ch, c.user_id) {
+		send_err(c, w.kind, w.seq, "not_a_member")
+		return nil
+	}
+	return ch
+}
+
+// Bearbeitungsmodus betreten: prüft Autor, Limit und die 1-Minuten-Frist
+// (ab Original bzw. letztem Edit) und reserviert die Freigabe. Ab jetzt
+// darf beliebig lange getippt werden — die Frist gilt nur für den Einstieg.
+handle_edit_start :: proc(c: ^Client_Conn, w: shared.Wire) {
+	ch := edit_channel_of(c, w)
+	if ch == nil {
+		return
+	}
+	msg, ok := load_message(ch, w.message_id)
+	if !ok {
+		send_err(c, w.kind, w.seq, "not_found")
+		return
+	}
+	if msg.author_id != c.user_id {
+		send_err(c, w.kind, w.seq, "not_allowed")
+		return
+	}
+	if msg.edit_count >= shared.MAX_MESSAGE_EDITS {
+		send_err(c, w.kind, w.seq, "edit_limit")
+		return
+	}
+	base := msg.edited_ms > 0 ? msg.edited_ms : msg.ts_ms
+	if now_ms() - base > shared.EDIT_WINDOW_MS {
+		send_err(c, w.kind, w.seq, "edit_window")
+		return
+	}
+
+	g.open_edits[w.message_id] = c.user_id
+	send_to(c, shared.wire_ok(w.kind, w.seq))
+}
+
+handle_edit_cancel :: proc(c: ^Client_Conn, w: shared.Wire) {
+	if g.open_edits[w.message_id] == c.user_id {
+		delete_key(&g.open_edits, w.message_id)
+	}
+	send_to(c, shared.wire_ok(w.kind, w.seq))
+}
+
+handle_edit_message :: proc(c: ^Client_Conn, w: shared.Wire) {
+	ch := edit_channel_of(c, w)
+	if ch == nil {
+		return
+	}
+	text := strings.trim_space(w.text)
+	if len(text) == 0 || len(text) > shared.MAX_MESSAGE_TEXT_LEN {
+		send_err(c, w.kind, w.seq, "invalid_request")
+		return
+	}
+	// Commit nur mit offener Freigabe (edit_start) — sie kodiert, dass der
+	// Einstieg innerhalb der Frist passiert ist.
+	if uid, has := g.open_edits[w.message_id]; !has || uid != c.user_id {
+		send_err(c, w.kind, w.seq, "edit_window")
+		return
+	}
+	msg, ok := load_message(ch, w.message_id)
+	if !ok {
+		delete_key(&g.open_edits, w.message_id)
+		send_err(c, w.kind, w.seq, "not_found")
+		return
+	}
+	if msg.author_id != c.user_id {
+		send_err(c, w.kind, w.seq, "not_allowed")
+		return
+	}
+	if msg.edit_count >= shared.MAX_MESSAGE_EDITS {
+		delete_key(&g.open_edits, w.message_id)
+		send_err(c, w.kind, w.seq, "edit_limit")
+		return
+	}
+
+	now := now_ms()
+	if !store_edit(ch, msg.id, text, now) {
+		fmt.printfln("[error] Edit von Nachricht %d (Channel %d) konnte nicht gespeichert werden", msg.id, ch.id)
+		send_err(c, w.kind, w.seq, "invalid_request")
+		return
+	}
+	delete_key(&g.open_edits, w.message_id)
+
+	msg.text = text
+	msg.edited_ms = now
+	msg.edit_count += 1
+
+	resp := shared.wire_ok(w.kind, w.seq)
+	resp.message = msg
+	send_to(c, resp)
+
+	ev := shared.Wire{kind = shared.EV_MESSAGE_EDITED, message = msg}
+	broadcast_members(ch, ev, c)
+
+	fmt.printfln("[edit] Nachricht %d (Channel %d) von User %d bearbeitet (%d/%d)",
+		msg.id, ch.id, c.user_id, msg.edit_count, shared.MAX_MESSAGE_EDITS)
+}
+
+handle_message_history :: proc(c: ^Client_Conn, w: shared.Wire) {
+	ch := edit_channel_of(c, w)
+	if ch == nil {
+		return
+	}
+	vers := load_message_versions(ch, w.message_id)
+	if len(vers) == 0 {
+		send_err(c, w.kind, w.seq, "not_found")
+		return
+	}
+	resp := shared.wire_ok(w.kind, w.seq)
+	resp.messages = vers
+	resp.channel_id = ch.id
+	resp.message_id = w.message_id
 	send_to(c, resp)
 }

@@ -69,6 +69,11 @@ Server_State :: struct {
 	sessions:   [dynamic]Session,
 	channels:   [dynamic]Channel,
 	conns:      [dynamic]^Client_Conn,
+
+	// Offene Bearbeitungs-Freigaben (message_id → user_id). edit_start prüft
+	// die 1-Minuten-Frist und legt den Eintrag an; edit_message verlangt ihn.
+	// Bewusst nur im RAM: ein Server-Neustart beendet offene Edits.
+	open_edits: map[u64]u64,
 }
 
 g: Server_State
@@ -148,6 +153,7 @@ wire_user :: proc(u: ^User) -> shared.User {
 		display_name = u.display_name,
 		is_admin     = u.is_admin,
 		online       = user_online(u.id),
+		in_call      = call_user_active(u.id),
 	}
 }
 

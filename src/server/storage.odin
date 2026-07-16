@@ -270,13 +270,30 @@ message_aad :: proc(channel_id: u64) -> [8]byte {
 	return aad
 }
 
-// Record (append-only): u32 big-endian Länge des Rests || nonce(24) || tag(16) || ciphertext.
-store_message :: proc(ch: ^Channel, msg: shared.Chat_Message) -> bool {
-	pt, merr := json.marshal(msg, {}, context.temp_allocator)
-	if merr != nil {
-		return false
-	}
+// Ein entschlüsselter Log-Eintrag: entweder eine Nachricht (edit_of == 0)
+// oder ein Edit-Record, der text/ts einer früheren Nachricht überschreibt.
+// Alte Logs (nur Nachrichten) parsen unverändert — edit_of fehlt dort und
+// bleibt 0.
+Log_Entry :: struct {
+	id:         u64    `json:"id"`,
+	channel_id: u64    `json:"channel_id"`,
+	author_id:  u64    `json:"author_id"`,
+	ts_ms:      i64    `json:"ts_ms"`,
+	text:       string `json:"text"`,
+	edit_of:    u64    `json:"edit_of"`,
+}
 
+// Edit-Record auf der Platte (append-only, wie Nachrichten verschlüsselt).
+@(private = "file")
+Edit_Rec :: struct {
+	edit_of: u64    `json:"edit_of"`,
+	ts_ms:   i64    `json:"ts_ms"`,
+	text:    string `json:"text"`,
+}
+
+// Record (append-only): u32 big-endian Länge des Rests || nonce(24) || tag(16) || ciphertext.
+@(private = "file")
+append_log :: proc(ch: ^Channel, pt: []byte) -> bool {
 	rest := NONCE_LEN + TAG_LEN + len(pt)
 	rec := make([]byte, 4 + rest, context.temp_allocator)
 	rec[0] = byte(rest >> 24)
@@ -299,16 +316,32 @@ store_message :: proc(ch: ^Channel, msg: shared.Chat_Message) -> bool {
 	return werr == nil && n == len(rec)
 }
 
-// Historie lesen: Records entschlüsseln, nach before_id filtern,
-// die letzten `limit` in aufsteigender Reihenfolge zurückgeben.
-// Ergebnis liegt im temp_allocator.
-load_history :: proc(ch: ^Channel, before_id: u64, limit: int) -> []shared.Chat_Message {
+store_message :: proc(ch: ^Channel, msg: shared.Chat_Message) -> bool {
+	pt, merr := json.marshal(msg, {}, context.temp_allocator)
+	if merr != nil {
+		return false
+	}
+	return append_log(ch, pt)
+}
+
+store_edit :: proc(ch: ^Channel, msg_id: u64, text: string, ts_ms: i64) -> bool {
+	pt, merr := json.marshal(Edit_Rec{edit_of = msg_id, ts_ms = ts_ms, text = text}, {}, context.temp_allocator)
+	if merr != nil {
+		return false
+	}
+	return append_log(ch, pt)
+}
+
+// Alle Records eines Channel-Logs entschlüsseln (temp-alloziert, in
+// Schreibreihenfolge — Edits stehen immer hinter ihrer Nachricht).
+@(private = "file")
+load_log :: proc(ch: ^Channel) -> []Log_Entry {
 	data, rerr := os.read_entire_file(messages_path(ch.id), context.temp_allocator)
 	if rerr != nil {
-		return nil // Datei existiert noch nicht → leere Historie
+		return nil // Datei existiert noch nicht → leeres Log
 	}
 
-	msgs := make([dynamic]shared.Chat_Message, context.temp_allocator)
+	entries := make([dynamic]Log_Entry, context.temp_allocator)
 	aad := message_aad(ch.id)
 	off := 0
 	for off + 4 <= len(data) {
@@ -328,18 +361,87 @@ load_history :: proc(ch: ^Channel, before_id: u64, limit: int) -> []shared.Chat_
 			fmt.printfln("[error] Message-Record von Channel %d nicht entschlüsselbar", ch.id)
 			break
 		}
-		msg: shared.Chat_Message
-		if json.unmarshal(pt, &msg, json.DEFAULT_SPECIFICATION, context.temp_allocator) != nil {
+		e: Log_Entry
+		if json.unmarshal(pt, &e, json.DEFAULT_SPECIFICATION, context.temp_allocator) != nil {
 			break
 		}
-		if before_id != 0 && msg.id >= before_id {
+		append(&entries, e)
+	}
+	return entries[:]
+}
+
+@(private = "file")
+entry_message :: proc(e: Log_Entry) -> shared.Chat_Message {
+	return {id = e.id, channel_id = e.channel_id, author_id = e.author_id, ts_ms = e.ts_ms, text = e.text}
+}
+
+// Historie lesen: Log abspielen (Edits überschreiben ihre Nachricht), nach
+// before_id filtern, die letzten `limit` in aufsteigender Reihenfolge
+// zurückgeben. Ergebnis liegt im temp_allocator.
+load_history :: proc(ch: ^Channel, before_id: u64, limit: int) -> []shared.Chat_Message {
+	msgs := make([dynamic]shared.Chat_Message, context.temp_allocator)
+	index := make(map[u64]int, context.temp_allocator)
+	for e in load_log(ch) {
+		if e.edit_of != 0 {
+			if idx, ok := index[e.edit_of]; ok {
+				m := &msgs[idx]
+				m.text = e.text
+				m.edited_ms = e.ts_ms
+				m.edit_count += 1
+			}
 			continue
 		}
-		append(&msgs, msg)
+		index[e.id] = len(msgs)
+		append(&msgs, entry_message(e))
 	}
 
-	if len(msgs) > limit {
-		return msgs[len(msgs) - limit:]
+	// Erst nach dem Replay filtern — Edits liegen im Log auch hinter
+	// before_id, gehören aber zu älteren Nachrichten.
+	out := msgs[:]
+	if before_id != 0 {
+		filtered := make([dynamic]shared.Chat_Message, context.temp_allocator)
+		for m in out {
+			if m.id < before_id {
+				append(&filtered, m)
+			}
+		}
+		out = filtered[:]
 	}
-	return msgs[:]
+	if len(out) > limit {
+		return out[len(out) - limit:]
+	}
+	return out
+}
+
+// Aktuellen Stand EINER Nachricht laden (inkl. angewandter Edits).
+load_message :: proc(ch: ^Channel, msg_id: u64) -> (msg: shared.Chat_Message, ok: bool) {
+	for e in load_log(ch) {
+		if e.edit_of == 0 && e.id == msg_id {
+			msg = entry_message(e)
+			ok = true
+		} else if e.edit_of == msg_id && ok {
+			msg.text = e.text
+			msg.edited_ms = e.ts_ms
+			msg.edit_count += 1
+		}
+	}
+	return
+}
+
+// Alle Versionen einer Nachricht, Original zuerst. text/ts_ms je Version,
+// edit_count trägt den Versionsindex (0 = Original).
+load_message_versions :: proc(ch: ^Channel, msg_id: u64) -> []shared.Chat_Message {
+	vers := make([dynamic]shared.Chat_Message, context.temp_allocator)
+	for e in load_log(ch) {
+		if e.edit_of == 0 && e.id == msg_id {
+			append(&vers, entry_message(e))
+		} else if e.edit_of == msg_id && len(vers) > 0 {
+			v := vers[0]
+			v.text = e.text
+			v.ts_ms = e.ts_ms
+			v.edit_count = len(vers)
+			append(&vers, v)
+		}
+	}
+	return vers[:]
 }

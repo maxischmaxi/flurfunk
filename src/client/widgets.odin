@@ -26,6 +26,7 @@ Focus :: enum {
 	Auth_Pass,
 	Setup_Name,
 	Message,
+	Edit, // Inline-Editor einer Nachricht
 	Modal_Input,
 	Switcher,
 }
@@ -53,10 +54,12 @@ UI_Ctx :: struct {
 	focus:          Focus,
 	drag_focus:     Focus, // Textfeld, in dem gerade eine Maus-Selektion läuft
 
-	// Doppelklick-Erkennung
+	// Mehrfachklick-Erkennung (Browser-Verhalten: 2× Wort, 3× Zeile)
 	last_click_t:   f64,
 	last_click_pos: rl.Vector2,
+	click_streak:   int, // 1 → 2 → 3 → 1 … solange Klicks schnell am Ort bleiben
 	double_click:   bool,
+	triple_click:   bool,
 
 	// Tooltip-Verwaltung
 	hot_id:      u64,
@@ -72,6 +75,15 @@ UI_Ctx :: struct {
 	tab_focus:    u64,               // per Tab fokussiertes Widget (0 = keins)
 	tab_nav:      bool,              // Tastatur-Navigation aktiv → Fokus-Ring sichtbar
 	tab_activate: bool,              // Enter/Leertaste aktiviert das fokussierte Widget
+
+	// Schwebendes Overlay (Call-Popout): fängt die Maus für alle Base-
+	// Widgets darunter ab. Das Overlay zeichnet spät im Frame und setzt
+	// sein Rect für den NÄCHSTEN Frame (1 Frame Versatz, unmerklich).
+	overlay:    rl.Rectangle,
+	overlay_on: bool,
+	in_overlay: bool, // true, während die Overlay-eigenen Widgets zeichnen
+
+	applied_cursor: rl.MouseCursor, // zuletzt an raylib gemeldeter Cursor
 }
 
 ui_begin_frame :: proc(app: ^App, modal_open: bool) {
@@ -87,19 +99,28 @@ ui_begin_frame :: proc(app: ^App, modal_open: bool) {
 	ui.cursor = .DEFAULT
 	ui.any_hot = false
 	ui.tip_show = false
+	chat_sel_frame() // Text-Runs des letzten Frames verwerfen
 
 	ui.double_click = false
+	ui.triple_click = false
 	if ui.clicked {
 		t := rl.GetTime()
 		d := rl.Vector2{ui.mouse.x - ui.last_click_pos.x, ui.mouse.y - ui.last_click_pos.y}
-		if t - ui.last_click_t < 0.35 && abs(d.x) < 5 && abs(d.y) < 5 {
-			ui.double_click = true
+		if t - ui.last_click_t < 0.4 && abs(d.x) < 5 && abs(d.y) < 5 {
+			ui.click_streak = ui.click_streak % 3 + 1 // nach 3× beginnt der Zyklus neu
+		} else {
+			ui.click_streak = 1
 		}
+		ui.double_click = ui.click_streak == 2
+		ui.triple_click = ui.click_streak == 3
 		ui.last_click_t = t
 		ui.last_click_pos = ui.mouse
 	}
 	if !ui.mouse_down {
 		ui.drag_focus = .None
+		// Failsafe: Loslassen beendet den Chat-Text-Drag immer — auch wenn
+		// die Liste, die ihn pflegt, gerade nicht mehr gezeichnet wird.
+		g_sel.dragging = false
 	}
 
 	// --- Tab-Navigation ---
@@ -109,8 +130,10 @@ ui_begin_frame :: proc(app: ^App, modal_open: bool) {
 	clear(&ui.tab_stops)
 
 	// Der Quick Switcher hat eine eigene Pfeiltasten-Navigation und
-	// erzwingt seinen Fokus — Tab dort nicht umbiegen.
-	if key_pressed(.TAB) && app.modal != .Quick_Switch {
+	// erzwingt seinen Fokus — Tab dort nicht umbiegen. Steht der Caret des
+	// fokussierten Eingabefelds in einem ```-Code-Block, gehört Tab dem
+	// Editor (Einrückung) statt der Fokus-Navigation.
+	if key_pressed(.TAB) && app.modal != .Quick_Switch && !editor_wants_tab(app) {
 		stops := make([dynamic]Tab_Stop, context.temp_allocator)
 		for s in ui.tab_prev {
 			if s.layer == ui.layer {
@@ -163,22 +186,49 @@ tab_stop :: proc(app: ^App, id: u64, r: rl.Rectangle, layer: UI_Layer, focus: Fo
 }
 
 // Fokus-Ring um ein Widget (3 px Abstand, 2 px stark).
-draw_focus_ring :: proc(r: rl.Rectangle, radius: f32, col: rl.Color = COL_ACCENT) {
-	rrect_lines({r.x - 3, r.y - 3, r.width + 6, r.height + 6}, radius + 3, 2, col)
+draw_focus_ring :: proc(r: rl.Rectangle, radius: f32) {
+	rrect_lines({r.x - 3, r.y - 3, r.width + 6, r.height + 6}, radius + 3, 2, COL_ACCENT)
 }
 
 ui_end_frame :: proc(app: ^App) {
 	ui := &app.ui
-	rl.SetMouseCursor(ui.cursor)
+	// Während einer laufenden Text-Selektion (Chat oder Eingabefeld) hält
+	// der I-Beam durch — egal, worüber die Maus gerade zieht.
+	if g_sel.dragging || ui.drag_focus != .None {
+		ui.cursor = .IBEAM
+	}
+	// Nur bei Änderung setzen: manche Plattformen flackern sonst, weil das
+	// Cursor-Bild jeden Frame neu geladen wird.
+	if ui.cursor != ui.applied_cursor {
+		rl.SetMouseCursor(ui.cursor)
+		ui.applied_cursor = ui.cursor
+	}
 	if !ui.any_hot {
 		ui.hot_id = 0
 		ui.hot_t = 0
 	}
 }
 
-// Hover nur, wenn der Layer des Widgets gerade aktiv ist.
+// Hover nur, wenn der Layer des Widgets gerade aktiv ist — und nur im
+// sichtbaren (nicht weggeschnittenen) Bereich, damit geclippte Widgets
+// nicht durch ihre Abdeckung hindurch reagieren.
 ui_hover :: proc(ui: ^UI_Ctx, r: rl.Rectangle, layer: UI_Layer) -> bool {
-	return ui.layer == layer && rl.CheckCollisionPointRec(ui.mouse, r)
+	if g_sel.dragging {
+		// Text-Drag im Chat: kein Widget reagiert auf die Maus (kein
+		// Hover-Cursor, keine Tooltips, kein aufploppendes Panel)
+		return false
+	}
+	if ui.layer != layer {
+		return false
+	}
+	if layer == .Base && ui.overlay_on && !ui.in_overlay &&
+	   rl.CheckCollisionPointRec(ui.mouse, ui.overlay) {
+		return false // Maus liegt über dem schwebenden Call-Popout
+	}
+	if g_clip_on && !rl.CheckCollisionPointRec(ui.mouse, g_clip) {
+		return false
+	}
+	return rl.CheckCollisionPointRec(ui.mouse, r)
 }
 
 ui_click :: proc(ui: ^UI_Ctx, r: rl.Rectangle, layer: UI_Layer) -> bool {
@@ -225,8 +275,8 @@ ui_draw_tooltip :: proc(app: ^App) {
 	}
 	alpha := clamp((ui.hot_t - 0.45) * 8, 0, 1)
 	r := rl.Rectangle{x, y, w, h}
-	rrect(r, 6, fade(rl.Color{24, 24, 27, 240}, alpha))
-	draw_text(font, tcstr(ui.tip_text), {x + pad, y + (h - 13)/2 - 1}, 13, 0, fade(COL_WHITE, alpha))
+	rrect(r, 6, fade(COL_TOOLTIP_BG, alpha))
+	draw_text(font, tcstr(ui.tip_text), {x + pad, y + (h - 13)/2 - 1}, 13, 0, fade(COL_TOOLTIP_FG, alpha))
 }
 
 // Taste gedrückt inkl. Key-Repeat.
@@ -319,7 +369,6 @@ ti_move :: proc(ti: ^Text_Input, pos: int, extend: bool) {
 	}
 }
 
-@(private = "file")
 is_word_rune :: proc(r: rune) -> bool {
 	switch r {
 	case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9', '_':
@@ -349,6 +398,20 @@ word_right :: proc(runes: []rune, i: int) -> int {
 		j += 1
 	}
 	return j
+}
+
+// Logische Zeile (zwischen \n) um Index i selektieren (Dreifachklick).
+ti_select_line :: proc(ti: ^Text_Input, i: int) {
+	lo := clamp(i, 0, len(ti.runes))
+	hi := lo
+	for lo > 0 && ti.runes[lo-1] != '\n' {
+		lo -= 1
+	}
+	for hi < len(ti.runes) && ti.runes[hi] != '\n' {
+		hi += 1
+	}
+	ti.sel = lo
+	ti.cursor = hi
 }
 
 // Wort unter Index selektieren (Doppelklick).
@@ -410,7 +473,8 @@ ti_update :: proc(app: ^App, ti: ^Text_Input, multiline: bool, max_runes := 0) -
 					if max_runes != 0 && len(ti.runes) >= max_runes {
 						break
 					}
-					if r >= 32 || (r == '\n' && multiline) {
+					// Tabs überleben das Einfügen (Code-Einrückung!)
+					if r >= 32 || ((r == '\n' || r == '\t') && multiline) {
 						ti_insert(ti, r)
 					}
 				}
@@ -556,7 +620,9 @@ text_field :: proc(
 	if ui.clicked && ui.layer == layer && hovered {
 		ui.focus = focus_id
 		idx := ti_index_at(font, 15, shown_runes, ui.mouse.x - (r.x + pad - offset))
-		if ui.double_click {
+		if ui.triple_click {
+			ti_select_line(ti, idx) // einzeilig = kompletter Inhalt
+		} else if ui.double_click {
 			ti_select_word(ti, idx)
 		} else {
 			ti_move(ti, idx, shift_down())
@@ -575,7 +641,7 @@ text_field :: proc(
 
 	// Rahmen + Hintergrund + Fokus-Glow
 	t := anim_to(app, anim_id(.Input_Focus, u64(focus_id)), focused ? 1 : 0, 18)
-	rrect(r, RADIUS_INPUT, COL_WHITE)
+	rrect(r, RADIUS_INPUT, COL_SURFACE)
 	if t > 0.01 {
 		glow := rl.Rectangle{r.x - 3, r.y - 3, r.width + 6, r.height + 6}
 		rrect_lines(glow, RADIUS_INPUT + 3, 3, fade(COL_ACCENT_SOFT, t))
@@ -636,27 +702,27 @@ button :: proc(app: ^App, r: rl.Rectangle, label: string, layer: UI_Layer, style
 	has_border := false
 	switch style {
 	case .Default:
-		bg = mix(COL_WHITE, rl.Color{243, 243, 243, 255}, t)
+		bg = mix(COL_SURFACE, COL_SURFACE_HOVER, t)
 		fg = COL_TEXT
 		border = COL_BORDER
 		has_border = true
 	case .Primary:
 		bg = mix(COL_PRIMARY, COL_PRIMARY_HOVER, t)
-		fg = COL_WHITE
+		fg = COL_PRIMARY_FG
 	case .Danger:
-		bg = mix(COL_WHITE, rl.Color{254, 242, 242, 255}, t)
+		bg = mix(COL_SURFACE, COL_RED_SOFT, t)
 		fg = COL_RED
 		border = fade(COL_RED, 0.45)
 		has_border = true
 	case .Danger_Solid:
-		bg = mix(COL_RED, rl.Color{185, 40, 40, 255}, t)
-		fg = COL_WHITE
+		bg = mix(COL_RED, COL_RED_HOVER, t)
+		fg = COL_WHITE // Rot bleibt Rot — Weiß trägt in beiden Themes
 	case .Ghost:
-		bg = fade(rl.Color{24, 24, 27, 255}, t * 0.06)
+		bg = fade(COL_OVERLAY, t * 0.06)
 		fg = COL_TEXT_DIM
 	}
 	if pressed {
-		bg = mix(bg, rl.Color{0, 0, 0, 255}, 0.07)
+		bg = mix(bg, COL_PRESS, 0.07)
 	}
 
 	rr := r
@@ -718,7 +784,7 @@ scrollbar :: proc(app: ^App, area: rl.Rectangle, content_h: f32, s: ^Scroll, lay
 	if a < 0.02 {
 		return
 	}
-	col := (thumb_hover || s.dragging) ? rl.Color{120, 120, 120, 200} : rl.Color{150, 150, 150, 140}
+	col := (thumb_hover || s.dragging) ? COL_SCROLL_THUMB_HOT : COL_SCROLL_THUMB
 	rrect(thumb, 3, fade(col, a))
 }
 
@@ -750,6 +816,113 @@ draw_plus :: proc(cx, cy, half, thick: f32, color: rl.Color) {
 	y := math.round(cy)
 	rl.DrawRectangleRec({x - half, y - thick/2, half*2, thick}, color)
 	rl.DrawRectangleRec({x - thick/2, y - half, thick, half*2}, color)
+}
+
+// Häkchen aus zwei Strichen (✓ liegt nicht im Font-Atlas).
+// Der Punkt im Knick füllt die Lücke, die zwei dicke Linien dort lassen.
+draw_check :: proc(cx, cy, size, thick: f32, color: rl.Color) {
+	a := rl.Vector2{cx - size*0.46, cy + size*0.02}
+	b := rl.Vector2{cx - size*0.14, cy + size*0.34}
+	c := rl.Vector2{cx + size*0.48, cy - size*0.34}
+	rl.DrawLineEx(a, b, thick, color)
+	rl.DrawLineEx(b, c, thick, color)
+	rl.DrawCircleV(b, thick/2, color)
+}
+
+// X-Icon aus zwei gekreuzten Strichen (Schließen/Abbrechen).
+draw_cross :: proc(cx, cy, size, thick: f32, color: rl.Color) {
+	h := size / 2
+	rl.DrawLineEx({cx - h, cy - h}, {cx + h, cy + h}, thick, color)
+	rl.DrawLineEx({cx - h, cy + h}, {cx + h, cy - h}, thick, color)
+}
+
+// Drei vertikale Punkte („Mehr"-Icon).
+draw_dots_v :: proc(cx, cy, gap, r: f32, color: rl.Color) {
+	for i in -1 ..= 1 {
+		rl.DrawCircleV({cx, cy + f32(i)*gap}, r, color)
+	}
+}
+
+// Kopfhörer: Bügel (oberer Halbring) + zwei Muscheln. `r` ≈ halbe Breite.
+// (raylib-Sektorwinkel: 0° = rechts (+X), positiv im Uhrzeigersinn)
+draw_headphones :: proc(cx, cy, r, thick: f32, color: rl.Color) {
+	rl.DrawRing({cx, cy + r*0.25}, r - thick, r, 180, 360, 24, color)
+	ear_w := max(thick + 1.5, r*0.42)
+	ear_h := r * 0.8
+	rrect({cx - r - ear_w*0.35, cy + r*0.25 - ear_h*0.25, ear_w, ear_h}, ear_w/2, color)
+	rrect({cx + r - ear_w*0.65, cy + r*0.25 - ear_h*0.25, ear_w, ear_h}, ear_w/2, color)
+}
+
+// Mikrofon: Kapsel + Auffangbügel + Ständer; optional durchgestrichen.
+// `bg` ist die Fläche unter dem Icon (Kontur des Streichstrichs).
+draw_mic :: proc(cx, cy, size, thick: f32, color, bg: rl.Color, crossed: bool) {
+	caps_w := size * 0.42
+	caps_h := size * 0.72
+	rrect({cx - caps_w/2, cy - size*0.55, caps_w, caps_h}, caps_w/2, color)
+	rl.DrawRing({cx, cy + size*0.02}, size*0.38 - thick, size*0.38, 0, 180, 20, color)
+	rl.DrawLineEx({cx, cy + size*0.4}, {cx, cy + size*0.56}, thick, color)
+	rl.DrawLineEx({cx - size*0.24, cy + size*0.56}, {cx + size*0.24, cy + size*0.56}, thick, color)
+	if crossed {
+		h := size * 0.62
+		rl.DrawLineEx({cx - h + 2, cy - h}, {cx + h + 2, cy + h}, thick + 2, bg)
+		rl.DrawLineEx({cx - h, cy - h}, {cx + h, cy + h}, thick, color)
+	}
+}
+
+// „Auflegen“: flach liegender Hörer (Bogen unten + zwei Endstücke).
+draw_hangup :: proc(cx, cy, r, thick: f32, color: rl.Color) {
+	rl.DrawRing({cx, cy - r*0.55}, r - thick, r, 28, 152, 24, color)
+	rl.DrawCircleV({cx - r*0.86, cy - r*0.55 + r*0.45}, thick*0.72, color)
+	rl.DrawCircleV({cx + r*0.86, cy - r*0.55 + r*0.45}, thick*0.72, color)
+}
+
+// „Ausgliedern“: Rahmen + Pfeil aus der Ecke nach oben rechts.
+draw_popout_icon :: proc(cx, cy, size, thick: f32, color: rl.Color) {
+	h := size / 2
+	frame := rl.Rectangle{cx - h, cy - h + size*0.3, size*0.7, size*0.7}
+	rrect_lines(frame, 2, thick, color)
+	ax := cx + h * 0.15
+	ay := cy - h + size*0.15
+	rl.DrawLineEx({ax - size*0.28, ay + size*0.28}, {ax + size*0.1, ay - size*0.1}, thick, color)
+	rl.DrawLineEx({ax - size*0.18, ay - size*0.12}, {ax + size*0.12, ay - size*0.12}, thick, color)
+	rl.DrawLineEx({ax + size*0.12, ay - size*0.12}, {ax + size*0.12, ay + size*0.18}, thick, color)
+}
+
+// Copy-Icon: zwei versetzte Blätter. Das vordere wird in `bg` gefüllt,
+// damit das hintere sauber dahinter verschwindet — `bg` muss also die
+// tatsächliche Fläche unter dem Icon sein.
+draw_copy_icon :: proc(cx, cy, size, thick: f32, color, bg: rl.Color) {
+	s := size * 0.62
+	rad := size * 0.16
+	back := rl.Rectangle{cx - s*0.28, cy - s*0.72, s, s}
+	front := rl.Rectangle{cx - s*0.72, cy - s*0.28, s, s}
+	rrect_lines(back, rad, thick, color)
+	rrect(front, rad, bg)
+	rrect_lines(front, rad, thick, color)
+}
+
+// Sonne: Scheibe + acht Strahlen. `turn` dreht sie (Theme-Übergang).
+draw_sun :: proc(cx, cy, r, turn: f32, color: rl.Color) {
+	rl.DrawCircleV({cx, cy}, r*0.56, color)
+	thick := max(f32(1.4), r*0.19)
+	for i in 0 ..< 8 {
+		ang := math.to_radians(f32(i)*45 + turn)
+		dx := math.cos(ang)
+		dy := math.sin(ang)
+		rl.DrawLineEx(
+			{cx + dx*r*0.88, cy + dy*r*0.88},
+			{cx + dx*r*1.3, cy + dy*r*1.3},
+			thick, color,
+		)
+	}
+}
+
+// Mond: Scheibe, aus der eine zweite in Hintergrundfarbe ausgestanzt wird
+// — `bg` muss also exakt die Fläche unter dem Icon sein.
+draw_moon :: proc(cx, cy, r, turn: f32, color, bg: rl.Color) {
+	rl.DrawCircleV({cx, cy}, r, color)
+	ang := math.to_radians(f32(-38) + turn)
+	rl.DrawCircleV({cx + math.cos(ang)*r*0.62, cy + math.sin(ang)*r*0.62}, r*0.86, bg)
 }
 
 runes_str :: proc(runes: []rune) -> string {

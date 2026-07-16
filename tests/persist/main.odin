@@ -63,10 +63,13 @@ main :: proc() {
 	fmt.println("ok: login nach neustart, servername erhalten")
 
 	lc := request(&conn, &seq, {kind = shared.K_LIST_CHANNELS})
-	if len(lc.channels) != 4 { // general + DM + büro-küche + bulk (aus dem Smoke-Test)
-		fail("channels nach neustart", "erwartet 4, bekommen", len(lc.channels))
+	if len(lc.channels) != 5 { // general + DM + büro-küche + bulk + edits (aus dem Smoke-Test)
+		fail("channels nach neustart", "erwartet 5, bekommen", len(lc.channels))
 	}
-	fmt.println("ok: channels nach neustart vorhanden")
+	if len(lc.calls) != 0 { // Calls sind flüchtig — ein Neustart beendet sie
+		fail("calls nach neustart", "erwartet 0, bekommen", len(lc.calls))
+	}
+	fmt.println("ok: channels nach neustart vorhanden, keine geister-calls")
 
 	h := request(&conn, &seq, {kind = shared.K_HISTORY, channel_id = 1})
 	if len(h.messages) != 2 {
@@ -76,6 +79,51 @@ main :: proc() {
 		fail("history texte", "entschlüsselte texte falsch:", h.messages[0].text, "/", h.messages[1].text)
 	}
 	fmt.println("ok: history nach neustart korrekt entschlüsselt (inkl. emoji)")
+
+	// Edits überleben den Neustart: Replay aus dem verschlüsselten Log
+	edch_id: u64
+	for ch in lc.channels {
+		if ch.name == "edits" {
+			edch_id = ch.id
+		}
+	}
+	if edch_id == 0 {
+		fail("edits-channel fehlt")
+	}
+	he := request(&conn, &seq, {kind = shared.K_HISTORY, channel_id = edch_id})
+	if len(he.messages) != 1 || he.messages[0].text != "version vier" ||
+	   he.messages[0].edit_count != 3 || he.messages[0].edited_ms == 0 {
+		fail("edit nach neustart", "text =", he.messages[0].text, "count =", he.messages[0].edit_count)
+	}
+	mh := request(&conn, &seq, {kind = shared.K_MESSAGE_HISTORY, channel_id = edch_id, message_id = he.messages[0].id})
+	if len(mh.messages) != 4 || mh.messages[0].text != "version eins" || mh.messages[3].text != "version vier" {
+		fail("versionen nach neustart", "anzahl =", len(mh.messages))
+	}
+	// Neue Edits sind nach dem Neustart gesperrt (Freigaben leben nur im RAM,
+	// und die Frist ist ohnehin um)
+	er := request(&conn, &seq, {kind = shared.K_EDIT_MESSAGE, channel_id = edch_id, message_id = he.messages[0].id, text = "hack"})
+	if er.err != "edit_window" {
+		fail("edit-freigabe nach neustart", "err =", er.err)
+	}
+	fmt.println("ok: edits und versionen nach neustart korrekt")
+
+	// Tabs/Spaces in Code-Blöcken überleben das verschlüsselte Log byte-genau
+	// (Nachricht stammt aus dem Smoke-Test, Channel "büro-küche")
+	tabtext := "```go\nfunc main() {\n\tif x {\n\t\tfmt.Println(\"tabs\")\n\t}\n    spaces()\n}\n```"
+	uml_id: u64
+	for ch in lc.channels {
+		if ch.name == "büro-küche" {
+			uml_id = ch.id
+		}
+	}
+	if uml_id == 0 {
+		fail("büro-küche fehlt")
+	}
+	ht := request(&conn, &seq, {kind = shared.K_HISTORY, channel_id = uml_id})
+	if len(ht.messages) != 1 || ht.messages[0].text != tabtext {
+		fail("tabs nach neustart", "text nicht byte-genau erhalten")
+	}
+	fmt.println("ok: tabs in code-blöcken nach neustart byte-genau")
 
 	s := request(&conn, &seq, {kind = shared.K_SEND, channel_id = 1, text = "nach dem neustart"})
 	if !s.ok {

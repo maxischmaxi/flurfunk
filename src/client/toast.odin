@@ -80,9 +80,9 @@ draw_toasts :: proc(app: ^App, sw, sh: f32) {
 
 		r := rl.Rectangle{x, ry, w, h}
 		draw_shadow(r, 10, a * 0.7)
-		rrect(r, 10, fade(rl.Color{24, 24, 27, 245}, a))
+		rrect(r, 10, fade(COL_TOAST_BG, a))
 		rl.DrawCircleV({x + pad_x + 4, ry + h/2}, 4, fade(accent, a))
-		draw_text(font, tcstr(t.text), {x + pad_x + 18, ry + (h - 15)/2 - 1}, 15, 0, fade(COL_WHITE, a))
+		draw_text(font, tcstr(t.text), {x + pad_x + 18, ry + (h - 15)/2 - 1}, 15, 0, fade(COL_TOAST_FG, a))
 
 		y = ry - 8
 	}

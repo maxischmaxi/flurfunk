@@ -16,7 +16,7 @@ SIDEBAR_W :: 260
 HEADER_H :: 52
 
 ui_draw :: proc(app: ^App) {
-	ui_begin_frame(app, app.modal != .None || app.ctx.open)
+	ui_begin_frame(app, app.modal != .None || app.ctx.open || app.msg_menu.open)
 	zoom_shortcuts(app)
 
 	// Logische Bildschirmmaße (physisch / UI-Zoom)
@@ -25,6 +25,7 @@ ui_draw :: proc(app: ^App) {
 
 	if len(app.conns) == 0 {
 		draw_welcome(app, sw, sh)
+		draw_theme_switch(app, sw, COL_PANEL_BG)
 		draw_toasts(app, sw, sh)
 		ui_draw_tooltip(app)
 		ui_end_frame(app)
@@ -56,8 +57,22 @@ ui_draw :: proc(app: ^App) {
 		draw_chat(app, c, chat)
 	}
 
+	// Theme-Umschalter liegt über der Kopfzeile, aber unter den Modals —
+	// ein offenes Modal blockiert den Base-Layer ohnehin.
+	// Auth/Setup/Failed legen ein Panel über den Chat → andere Fläche.
+	header_bg := COL_CHAT_BG
+	#partial switch phase {
+	case .Auth_Needed, .Setup_Needed, .Failed:
+		header_bg = COL_PANEL_BG
+	}
+	draw_theme_switch(app, sw, header_bg)
+
+	// Ausgegliedertes Call-Panel schwebt über allem außer Modals/Menüs
+	draw_call_popout(app, sw, sh)
+
 	draw_modals(app, c, sw, sh)
 	draw_ctx_menu(app, c, sw, sh)
+	draw_msg_menu(app, c, sw, sh)
 	draw_toasts(app, sw, sh)
 	ui_draw_tooltip(app)
 	ui_end_frame(app)
@@ -94,6 +109,11 @@ global_shortcuts :: proc(app: ^App, c: ^Server_Conn, phase: Conn_Phase) {
 		}
 	}
 
+	// Strg+C: markierten Chat-Text kopieren (Eingabefeld-Selektion hat Vorrang)
+	if ctrl_down() && rl.IsKeyPressed(.C) && phase == .Ready {
+		sel_try_copy(app, c)
+	}
+
 	// Strg+1..9: Server wechseln
 	num_keys := [9]rl.KeyboardKey{.ONE, .TWO, .THREE, .FOUR, .FIVE, .SIX, .SEVEN, .EIGHT, .NINE}
 	if ctrl_down() {
@@ -105,7 +125,7 @@ global_shortcuts :: proc(app: ^App, c: ^Server_Conn, phase: Conn_Phase) {
 	}
 
 	// Alt+↑/↓: Channel wechseln
-	if app.modal == .None && phase == .Ready && alt_down() {
+	if app.modal == .None && !app.msg_menu.open && phase == .Ready && alt_down() {
 		if key_pressed(.UP) {
 			sidebar_step_channel(app, c, -1)
 		}
@@ -114,13 +134,19 @@ global_shortcuts :: proc(app: ^App, c: ^Server_Conn, phase: Conn_Phase) {
 		}
 	}
 
-	// Esc: Kontextmenü/Modal schließen → Tab-Navigation beenden →
-	// ans Chat-Ende springen → Fokus
+	// Esc: Dropdown/Kontextmenü/Modal schließen → Inline-Edit abbrechen →
+	// Tab-Navigation beenden → ans Chat-Ende springen → Fokus
 	if rl.IsKeyPressed(.ESCAPE) {
-		if app.ctx.open {
+		if app.theme_menu {
+			app.theme_menu = false
+		} else if app.ctx.open {
 			app.ctx.open = false
+		} else if app.msg_menu.open {
+			app.msg_menu.open = false
 		} else if app.modal != .None {
 			close_modal(app)
+		} else if c.edit_msg_id != 0 {
+			cancel_edit(app, c)
 		} else if app.ui.tab_nav {
 			app.ui.tab_nav = false
 			app.ui.tab_focus = 0
@@ -169,7 +195,7 @@ draw_welcome :: proc(app: ^App, sw, sh: f32) {
 	// Karte
 	card := rl.Rectangle{cx - 210, base_y + 172, 420, 158}
 	draw_shadow(card, RADIUS_CARD, 0.6)
-	rrect(card, RADIUS_CARD, COL_WHITE)
+	rrect(card, RADIUS_CARD, COL_SURFACE)
 	rrect_lines(card, RADIUS_CARD, 1, COL_BORDER)
 
 	draw_text(app.fonts.regular13, "Server-Adresse", {card.x + 24, card.y + 18}, 13, 0, COL_TEXT_DIM)
@@ -219,7 +245,8 @@ card_frame :: proc(app: ^App, chat: rl.Rectangle, w, h: f32) -> rl.Rectangle {
 	rl.DrawRectangleRec(chat, COL_PANEL_BG)
 	p := rl.Rectangle{chat.x + (chat.width - w)/2, chat.y + (chat.height - h)/2, w, h}
 	draw_shadow(p, RADIUS_CARD, 0.7)
-	rrect(p, RADIUS_CARD, COL_WHITE)
+	rrect(p, RADIUS_CARD, COL_SURFACE)
+	rrect_lines(p, RADIUS_CARD, 1, COL_BORDER)
 	return p
 }
 
@@ -250,14 +277,16 @@ draw_auth :: proc(app: ^App, c: ^Server_Conn, chat: rl.Rectangle) {
 			p.x + p.width/2, y, 13, COL_TEXT_DIM)
 		y += 34
 	} else {
-		// Segmented Control mit animiertem Slider
+		// Segmented Control mit animiertem Slider. Track getönt, Slider
+		// zurück auf Kartenniveau — der Kontrast kippt mit dem Theme
+		// (hell: Slider heller als der Track, dunkel: dunkler).
 		seg := rl.Rectangle{p.x + 24, y, p.width - 48, 40}
-		rrect(seg, 9, COL_RAIL_BG)
+		rrect(seg, 9, COL_RAIL_ITEM)
 		half := seg.width / 2
 		st := anim_to(app, anim_id(.Tab_Slider, u64(c.cfg_index)), f32(c.auth_tab), 16)
 		slider := rl.Rectangle{seg.x + 3 + st*(half - 3), seg.y + 3, half - 6, seg.height - 6}
 		draw_shadow(slider, 7, 0.25)
-		rrect(slider, 7, COL_WHITE)
+		rrect(slider, 7, COL_SURFACE)
 		for label, i in ([2]string{"Anmelden", "Registrieren"}) {
 			r := rl.Rectangle{seg.x + f32(i)*half, seg.y, half, seg.height}
 			selected := c.auth_tab == i
@@ -456,6 +485,11 @@ app_remove_server :: proc(app: ^App, idx: int) {
 		return
 	}
 	c := app.conns[idx]
+
+	// Hängt der aktive Call an diesem Server → lokal beenden
+	if app.call.active && app.call.conn == c {
+		call_teardown(app)
+	}
 
 	// Reader-Thread (falls noch aktiv) über Generation invalidieren
 	conn_invalidate(c)

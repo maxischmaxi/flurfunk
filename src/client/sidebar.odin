@@ -79,7 +79,7 @@ draw_rail :: proc(app: ^App, sh: f32) {
 	if focused {
 		draw_focus_ring(plus, 20 - t*8)
 	}
-	draw_plus(plus.x + plus.width/2, plus.y + plus.height/2, 7, 2, mix(COL_SIDEBAR_TEXT, COL_WHITE, t))
+	draw_plus(plus.x + plus.width/2, plus.y + plus.height/2, 7, 2, mix(COL_SIDEBAR_TEXT, COL_PRIMARY_FG, t))
 	if hovered {
 		app.ui.cursor = .POINTING_HAND
 	}
@@ -148,7 +148,8 @@ draw_sidebar :: proc(app: ^App, c: ^Server_Conn, phase: Conn_Phase, sh: f32) {
 	}
 
 	has_footer := c.me.id != 0
-	view_h := sh - HEADER_H - (has_footer ? FOOTER_H : 0)
+	panel_h := app.call.active && !app.call.popout ? CALL_PANEL_H : 0
+	view_h := sh - HEADER_H - (has_footer ? FOOTER_H : 0) - panel_h
 	view := rl.Rectangle{RAIL_W, HEADER_H, SIDEBAR_W, view_h}
 
 	// Inhaltshöhe (Zeilen à 30, Sektions-Header à 34)
@@ -190,13 +191,13 @@ draw_sidebar :: proc(app: ^App, c: ^Server_Conn, phase: Conn_Phase, sh: f32) {
 		if rclicked {
 			ctx_open(app, cs.ch.id)
 		}
-		col := is_active ? COL_WHITE : COL_SIDEBAR_TEXT
+		col := is_active ? COL_PRIMARY_FG : COL_SIDEBAR_TEXT
 		font := app.fonts.regular15
 		if cs.unread > 0 && !is_active {
 			col = COL_TEXT
 			font = app.fonts.bold15
 		}
-		draw_text(app.fonts.regular15, "#", {x + 20, y + 7}, 15, 0, is_active ? fade(COL_WHITE, 0.8) : COL_SIDEBAR_DIM)
+		draw_text(app.fonts.regular15, "#", {x + 20, y + 7}, 15, 0, is_active ? fade(COL_PRIMARY_FG, 0.8) : COL_SIDEBAR_DIM)
 		draw_text(font, tcstr(cs.ch.name), {x + 36, y + 7}, 15, 0, col)
 		if cs.unread > 0 && !is_active {
 			draw_badge(app, x + SIDEBAR_W - 16, y + 15, cs.unread, anim_id(.Badge_Pop, cs.ch.id))
@@ -211,7 +212,7 @@ draw_sidebar :: proc(app: ^App, c: ^Server_Conn, phase: Conn_Phase, sh: f32) {
 		if clicked {
 			open_modal(app, .Create_Channel)
 		}
-		rl.DrawCircleV({x + 27, y + 15}, 9, rl.Color{24, 24, 27, 12})
+		rl.DrawCircleV({x + 27, y + 15}, 9, fade(COL_OVERLAY, 0.05))
 		draw_plus(x + 27, y + 15, 4, 2, COL_SIDEBAR_TEXT)
 		draw_text(app.fonts.regular15, "Kanal erstellen", {x + 44, y + 7}, 15, 0, COL_SIDEBAR_DIM)
 		y += 30 + 18
@@ -236,7 +237,7 @@ draw_sidebar :: proc(app: ^App, c: ^Server_Conn, phase: Conn_Phase, sh: f32) {
 		}
 		draw_avatar(app, u.username, x + 18, y + 4, 22, presence = true, online = u.online)
 		label := u.display_name != "" ? u.display_name : u.username
-		col := is_active ? COL_WHITE : (u.online ? COL_SIDEBAR_TEXT : COL_SIDEBAR_DIM)
+		col := is_active ? COL_PRIMARY_FG : (u.online ? COL_SIDEBAR_TEXT : COL_SIDEBAR_DIM)
 		font := app.fonts.regular15
 		unread := dm != nil ? dm.unread : 0
 		if unread > 0 && !is_active {
@@ -246,12 +247,18 @@ draw_sidebar :: proc(app: ^App, c: ^Server_Conn, phase: Conn_Phase, sh: f32) {
 		draw_text(font, tcstr(label), {x + 48, y + 7}, 15, 0, col)
 		if unread > 0 && !is_active && dm != nil {
 			draw_badge(app, x + SIDEBAR_W - 16, y + 15, unread, anim_id(.Badge_Pop, dm.ch.id))
+		} else if u.in_call {
+			// Kopfhörer: die Person ist gerade in einem Voice-Call
+			draw_headphones(x + SIDEBAR_W - 26, y + 14, 6, 1.8, is_active ? COL_PRIMARY_FG : COL_ONLINE)
 		}
 		y += 30
 	}
 	scissor_end()
 
 	scrollbar(app, view, content_h, &c.sidebar_scroll, .Base)
+
+	// Aktiver Call: Panel zwischen Liste und Profil-Footer
+	draw_call_panel(app, sh, has_footer ? FOOTER_H : 0)
 
 	// Profil-Footer
 	if has_footer {
