@@ -271,7 +271,7 @@ draw_settings_modal :: proc(app: ^App, sw, sh: f32) {
 
 	x := p.x + 24
 	w := p.width - 48
-	y := p.y + 52
+	y := p.y + 48
 
 	// Offenes Dropdown → Klicks auf die darunterliegenden Widgets abschirmen
 	// (die Liste zeichnet und klickt am Ende dieses Frames).
@@ -281,16 +281,111 @@ draw_settings_modal :: proc(app: ^App, sw, sh: f32) {
 		app.ui.clicked = false
 	}
 
-	draw_text(app.fonts.bold13, "AUDIO", {x, y}, 13, 0, COL_TEXT_FAINT)
+	// Tabs: Audio / Verhalten
+	{
+		labels := [2]string{"Audio", "Verhalten"}
+		tx := x
+		for label, i in labels {
+			tw := rl.MeasureTextEx(app.fonts.regular15, tcstr(label), 15, 0).x
+			r := rl.Rectangle{tx, y, tw + 28, 32}
+			active := app.set_tab == i
+			hovered := ui_hover(&app.ui, r, .Modal)
+			focused := tab_stop(app, anim_id(.Misc, 0x7AB5 ~ (u64(i) << 32)), r, .Modal, radius = 8)
+			if active {
+				rrect(r, 8, COL_PRIMARY)
+			} else if hovered {
+				rrect(r, 8, COL_SIDEBAR_HOVER)
+			}
+			if focused {
+				draw_focus_ring(r, 8)
+			}
+			draw_text(app.fonts.regular15, tcstr(label),
+				{r.x + 14, r.y + (r.height - 15)/2 - 1}, 15, 0,
+				active ? COL_PRIMARY_FG : COL_TEXT_DIM)
+			if hovered {
+				app.ui.cursor = .POINTING_HAND
+			}
+			if ui_click(&app.ui, r, .Modal) || (focused && app.ui.tab_activate) {
+				if app.set_tab != i {
+					app.set_tab = i
+					app.set_dd = 0
+				}
+			}
+			tx += r.width + 8
+		}
+		y += 44
+	}
+
+	mic_r, out_r: rl.Rectangle
+	if app.set_tab == 1 {
+		draw_settings_behavior(app, x, y, w)
+	} else {
+		mic_r, out_r = draw_settings_audio(app, x, y, w)
+	}
+
+	// Schließen
+	if button(app, {p.x + p.width - 136, p.y + h - 50, 112, 36}, "Schließen", .Modal, id_salt = 0xC105E) {
+		close_modal(app)
+	}
+
+	if shield {
+		app.ui.clicked = saved_click
+	}
+
+	// Offenes Dropdown über allem zeichnen
+	if app.set_tab == 0 {
+		if app.set_dd == 1 {
+			settings_dd_list(app, sh, mic_r, app.set_devices_mic, &app.cfg.audio_mic)
+		} else if app.set_dd == 2 {
+			settings_dd_list(app, sh, out_r, app.set_devices_out, &app.cfg.audio_out)
+		}
+	}
+}
+
+// Tab „Verhalten": Close-to-Tray + Benachrichtigungen.
+@(private = "file")
+draw_settings_behavior :: proc(app: ^App, x, y, w: f32) {
+	y := y
+
+	draw_text(app.fonts.bold13, "FENSTER", {x, y}, 13, 0, COL_TEXT_FAINT)
 	y += 22
+	y += toggle_row(app, x, y, w, "Beim Schließen im Hintergrund weiterlaufen",
+		"X versteckt das Fenster nur — Flurfunk bleibt im Tray bzw. der Menüleiste",
+		&app.cfg.quit_on_close, true, 4)
+	if !app_tray_available() && !app.cfg.quit_on_close {
+		draw_text(app.fonts.regular13, tcstr(trim_label(app, app.fonts.regular13, 13,
+			"Kein System-Tray gefunden — beim Schließen wird die App trotzdem beendet.", w)),
+			{x, y}, 13, 0, COL_TEXT_FAINT)
+	}
+	y += 30
+
+	draw_text(app.fonts.bold13, "BENACHRICHTIGUNGEN", {x, y}, 13, 0, COL_TEXT_FAINT)
+	y += 22
+	y += toggle_row(app, x, y, w, "Desktop-Benachrichtigungen",
+		"Neue Nachrichten und Anrufe melden, wenn Flurfunk im Hintergrund ist",
+		&app.cfg.notify_off, true, 5)
+	y += 8
+
+	if button(app, {x, y, 210, 36}, "Testbenachrichtigung", .Modal, id_salt = 0x7E57F) {
+		if !app_notify_test(app) {
+			toast(app, .Error, "Benachrichtigungen sind hier nicht verfügbar")
+		}
+	}
+}
+
+// Tab „Audio": bisheriger Inhalt. Gibt die Dropdown-Anker zurück (die
+// offene Liste zeichnet draw_settings_modal am Frame-Ende darüber).
+@(private = "file")
+draw_settings_audio :: proc(app: ^App, x, y, w: f32) -> (mic_r, out_r: rl.Rectangle) {
+	y := y
 
 	draw_text(app.fonts.regular13, "Mikrofon", {x, y}, 13, 0, COL_TEXT_DIM)
-	mic_r := rl.Rectangle{x, y + 16, w, 36}
+	mic_r = rl.Rectangle{x, y + 16, w, 36}
 	dd_field(app, mic_r, device_label(app.cfg.audio_mic), app.set_dd == 1, 1)
 	y += 60
 
 	draw_text(app.fonts.regular13, "Lautsprecher", {x, y}, 13, 0, COL_TEXT_DIM)
-	out_r := rl.Rectangle{x, y + 16, w, 36}
+	out_r = rl.Rectangle{x, y + 16, w, 36}
 	dd_field(app, out_r, device_label(app.cfg.audio_out), app.set_dd == 2, 2)
 	y += 64
 
@@ -372,19 +467,5 @@ draw_settings_modal :: proc(app: ^App, sw, sh: f32) {
 	draw_text(app.fonts.regular13, tcstr(trim_label(app, app.fonts.regular13, 13, spk_hint, w - 184)),
 		{x + 184, y + 11}, 13, 0, COL_TEXT_FAINT)
 
-	// Schließen
-	if button(app, {p.x + p.width - 136, p.y + h - 50, 112, 36}, "Schließen", .Modal, id_salt = 0xC105E) {
-		close_modal(app)
-	}
-
-	if shield {
-		app.ui.clicked = saved_click
-	}
-
-	// Offenes Dropdown über allem zeichnen
-	if app.set_dd == 1 {
-		settings_dd_list(app, sh, mic_r, app.set_devices_mic, &app.cfg.audio_mic)
-	} else if app.set_dd == 2 {
-		settings_dd_list(app, sh, out_r, app.set_devices_out, &app.cfg.audio_out)
-	}
+	return
 }

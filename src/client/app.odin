@@ -106,6 +106,12 @@ App :: struct {
 	welcome_input: Text_Input,
 	welcome_error: string,
 
+	// Desktop-Integration (tray.odin / notify.odin)
+	hidden:        bool, // Fenster versteckt (Close-to-Tray)
+	want_quit:     bool, // echtes Beenden (Tray-Menü, Setting, Cmd+Q)
+	set_tab:       int,  // Settings-Dialog: 0 = Audio, 1 = Verhalten
+	notif_targets: map[u64]Notif_Target,
+
 	// Admin panel (adminui.odin): tab, inputs and inline confirmations.
 	adm_tab:         int,
 	adm_name_input:  Text_Input, // server name (general tab)
@@ -696,6 +702,7 @@ app_add_message :: proc(app: ^App, c: ^Server_Conn, m: shared.Chat_Message, is_a
 			cs.unread += 1
 			anim_pop(app, anim_id(.Badge_Pop, cs.ch.id))
 		}
+		app_notify_message(app, c, cs, m) // prüft Fokus/Setting selbst
 	} else if is_active_channel {
 		// eigene Nachricht → ans Ende springen, Divider erledigt
 		cs.stick_bottom = true
