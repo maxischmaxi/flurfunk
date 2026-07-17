@@ -10,7 +10,7 @@ import "core:strings"
 import rl "vendor:raylib"
 import shared "../shared"
 
-ADM_TABS := [5]string{"Allgemein", "Zugang", "Nutzer", "Channels", "Sicherheit"}
+ADM_TABS := [6]string{"Allgemein", "Zugang", "Anmeldung", "Nutzer", "Channels", "Sicherheit"}
 
 // Validity choices for new invites and manual IP bans (minutes, 0 = forever).
 ADM_INVITE_OPTS := [3]int{24 * 60, 7 * 24 * 60, 0}
@@ -25,6 +25,7 @@ open_admin :: proc(app: ^App, c: ^Server_Conn) {
 	app.adm_tab = 0
 	app.adm_reset_user = 0
 	app.adm_confirm_del = 0
+	app.adm_oauth_sel = -1
 	ti_set_text(&app.adm_name_input, c.server_name)
 	ti_clear(&app.adm_user_input)
 	ti_clear(&app.adm_disp_input)
@@ -72,6 +73,8 @@ admin_apply_reply :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, p: Pending
 		ti_clear(&app.adm_ban_input)
 	case shared.K_ADMIN_UNBAN_IP:
 		toast(app, .Info, "IP-Adresse entsperrt")
+	case shared.K_ADMIN_OAUTH_SET:
+		toast(app, .Success, "Anmeldedienst gespeichert")
 	}
 }
 
@@ -187,6 +190,7 @@ draw_admin_modal :: proc(app: ^App, c: ^Server_Conn, sw, sh: f32) {
 			app.adm_tab = i
 			app.adm_reset_user = 0
 			app.adm_confirm_del = 0
+			app.adm_oauth_sel = -1
 			scroll_to(&app.modal_scroll, 0)
 		}
 		ny += 38
@@ -208,10 +212,12 @@ draw_admin_modal :: proc(app: ^App, c: ^Server_Conn, sw, sh: f32) {
 	case 1:
 		adm_tab_access(app, c, content)
 	case 2:
-		adm_tab_users(app, c, content)
+		adm_tab_login(app, c, content)
 	case 3:
-		adm_tab_channels(app, c, content)
+		adm_tab_users(app, c, content)
 	case 4:
+		adm_tab_channels(app, c, content)
+	case 5:
 		adm_tab_security(app, c, content)
 	}
 }
@@ -382,6 +388,178 @@ adm_tab_access :: proc(app: ^App, c: ^Server_Conn, area: rl.Rectangle) {
 	y += 60
 }
 
+// ---------- Tab: Anmeldung (auth providers) ----------
+
+@(private = "file")
+adm_oauth_cfg :: proc(c: ^Server_Conn, id: string) -> shared.OAuth_Provider_Config {
+	for p in c.admin.oauth {
+		if p.id == id {
+			return p
+		}
+	}
+	return {id = id}
+}
+
+@(private = "file")
+adm_oauth_load_inputs :: proc(app: ^App, cfg: shared.OAuth_Provider_Config) {
+	ti_set_text(&app.adm_oa_client, cfg.client_id)
+	ti_set_text(&app.adm_oa_secret, cfg.client_secret)
+	ti_set_text(&app.adm_oa_issuer, cfg.issuer)
+	ti_set_text(&app.adm_oa_label, cfg.label)
+}
+
+@(private = "file")
+adm_oauth_send :: proc(c: ^Server_Conn, cfg: shared.OAuth_Provider_Config) {
+	conn_request(c, {kind = shared.K_ADMIN_OAUTH_SET, oauth = cfg})
+}
+
+// Height of the expanded config panel for one preset.
+@(private = "file")
+adm_oauth_panel_h :: proc(preset: ^shared.OAuth_Preset) -> f32 {
+	h := f32(52 + 62 + 62 + 48) // hint+redirect, client id, secret, save row
+	if preset.kind == .OIDC {
+		h += 62 // issuer field
+	}
+	if preset.id == "oidc" {
+		h += 62 // button label override
+	}
+	return h
+}
+
+@(private = "file")
+adm_tab_login :: proc(app: ^App, c: ^Server_Conn, area: rl.Rectangle) {
+	x := area.x
+	cw := area.width - 8
+	row_h := f32(56)
+	n := len(shared.OAUTH_PRESETS)
+	sel := app.adm_oauth_sel
+
+	content_h := 52 + f32(n) * row_h + 20
+	if sel >= 0 && sel < n {
+		content_h += adm_oauth_panel_h(&shared.OAUTH_PRESETS[sel])
+	}
+	hovered := ui_hover(&app.ui, area, .Modal)
+	scroll_update(app, &app.modal_scroll, hovered, max(0, content_h - area.height), 46)
+	scissor_begin(area.x, area.y, area.width, area.height)
+	defer {
+		scissor_end()
+		scrollbar(app, area, content_h, &app.modal_scroll, .Modal)
+	}
+	y := area.y + 4 - app.modal_scroll.pos
+
+	draw_text(app.fonts.regular13, "Nutzer melden sich im Browser beim Anbieter an. Beim ersten Login entsteht",
+		{x, y}, 13, 0, COL_TEXT_FAINT)
+	draw_text(app.fonts.regular13, "automatisch ein Konto — auch wenn die Registrierung geschlossen ist.",
+		{x, y + 18}, 13, 0, COL_TEXT_FAINT)
+	y += 48
+
+	for &preset, i in shared.OAUTH_PRESETS {
+		cfg := adm_oauth_cfg(c, preset.id)
+		salt := u64(0xADA0) ~ (u64(i + 1) << 24)
+		if y + row_h > area.y && y < area.y + area.height {
+			name := cfg.label != "" ? cfg.label : preset.label
+			draw_text(app.fonts.bold15, tcstr(name), {x, y + 8}, 15, 0, COL_TEXT)
+			status: string
+			scol := COL_TEXT_FAINT
+			switch {
+			case cfg.enabled:
+				status = "aktiv — Button erscheint auf der Anmeldeseite"
+				scol = COL_ONLINE
+			case cfg.client_id != "":
+				status = "konfiguriert, nicht aktiv"
+			case:
+				status = "nicht konfiguriert"
+			}
+			draw_text(app.fonts.regular13, tcstr(trim_label(app, app.fonts.regular13, 13, status, cw - 240)),
+				{x, y + 30}, 13, 0, scol)
+
+			if button(app, {x + cw - 46 - 12 - 118, y + 11, 118, 30},
+				sel == i ? "Schließen" : "Konfigurieren", .Modal, id_salt = salt ~ 0x1) {
+				if sel == i {
+					app.adm_oauth_sel = -1
+				} else {
+					app.adm_oauth_sel = i
+					adm_oauth_load_inputs(app, cfg)
+					app.ui.focus = .Adm_OA_Client
+				}
+			}
+			if toggle_switch(app, {x + cw - 46, y + 13, 46, 26}, anim_id(.Misc, salt ~ 0x2), cfg.enabled, .Modal) {
+				if cfg.enabled {
+					off := cfg
+					off.enabled = false
+					adm_oauth_send(c, off)
+				} else if cfg.client_id != "" && (preset.kind != .OIDC || cfg.issuer != "" || preset.issuer != "") {
+					on := cfg
+					on.enabled = true
+					adm_oauth_send(c, on)
+				} else {
+					app.adm_oauth_sel = i
+					adm_oauth_load_inputs(app, cfg)
+					app.ui.focus = .Adm_OA_Client
+					toast(app, .Error, "Bitte zuerst konfigurieren (Client-ID eintragen)")
+				}
+			}
+		}
+		y += row_h
+
+		// Expanded config panel below the selected provider.
+		if sel == i {
+			panel_h := adm_oauth_panel_h(&preset)
+			if y + panel_h > area.y && y < area.y + area.height {
+				py := y + 2
+				draw_text(app.fonts.regular13, tcstr(trim_label(app, app.fonts.regular13, 13, preset.hint, cw)),
+					{x, py}, 13, 0, COL_TEXT_FAINT)
+				py += 20
+				draw_text(app.fonts.regular13,
+					"Redirect-URI beim Anbieter: http://127.0.0.1:<Port>/callback (Port ist dynamisch, RFC 8252)",
+					{x, py}, 13, 0, COL_TEXT_FAINT)
+				py += 28
+
+				draw_text(app.fonts.regular13, "Client-ID", {x, py}, 13, 0, COL_TEXT_DIM)
+				py += 18
+				text_field(app, {x, py, cw, 36}, &app.adm_oa_client, .Adm_OA_Client, .Modal, "Client-ID des Anbieters")
+				py += 44
+
+				draw_text(app.fonts.regular13, "Client-Secret (bei PKCE-/Native-Apps oft leer)", {x, py}, 13, 0, COL_TEXT_DIM)
+				py += 18
+				text_field(app, {x, py, cw, 36}, &app.adm_oa_secret, .Adm_OA_Secret, .Modal, "optional")
+				py += 44
+
+				if preset.kind == .OIDC {
+					draw_text(app.fonts.regular13, "Issuer-URL", {x, py}, 13, 0, COL_TEXT_DIM)
+					py += 18
+					placeholder := preset.issuer != "" ? preset.issuer : "https://…"
+					text_field(app, {x, py, cw, 36}, &app.adm_oa_issuer, .Adm_OA_Issuer, .Modal, placeholder)
+					py += 44
+				}
+				if preset.id == "oidc" {
+					draw_text(app.fonts.regular13, "Button-Beschriftung (optional)", {x, py}, 13, 0, COL_TEXT_DIM)
+					py += 18
+					text_field(app, {x, py, cw, 36}, &app.adm_oa_label, .Adm_OA_Label, .Modal, "z. B. Firmen-Login")
+					py += 44
+				}
+
+				if button(app, {x, py, 130, 34}, "Speichern", .Modal, style = .Primary, id_salt = salt ~ 0x3) {
+					out := shared.OAuth_Provider_Config{
+						id            = preset.id,
+						enabled       = cfg.enabled,
+						client_id     = strings.trim_space(ti_text(&app.adm_oa_client)),
+						client_secret = strings.trim_space(ti_text(&app.adm_oa_secret)),
+						issuer        = strings.trim_space(ti_text(&app.adm_oa_issuer)),
+						label         = strings.trim_space(ti_text(&app.adm_oa_label)),
+					}
+					adm_oauth_send(c, out)
+				}
+			}
+			y += panel_h
+		}
+
+		if y > area.y && y < area.y + area.height {
+			rl.DrawLineEx({x, y - 4}, {x + cw, y - 4}, 1, COL_BORDER_SOFT)
+		}
+	}
+}
+
 // ---------- Tab: Nutzer ----------
 
 @(private = "file")
@@ -426,6 +604,13 @@ adm_tab_users :: proc(app: ^App, c: ^Server_Conn, area: rl.Rectangle) {
 			sub := fmt.tprintf("@%s · %s", u.username, u.online ? "online" : adm_seen_label(app, info.last_seen_ms))
 			if info.last_ip != "" {
 				sub = fmt.tprintf("%s · %s", sub, info.last_ip)
+			}
+			if info.oauth_provider != "" {
+				plabel := info.oauth_provider
+				if pr := shared.oauth_preset(info.oauth_provider); pr != nil {
+					plabel = pr.label
+				}
+				sub = fmt.tprintf("%s · via %s", sub, plabel)
 			}
 			draw_text(app.fonts.regular13, tcstr(trim_label(app, app.fonts.regular13, 13, sub, cw - 46 - 240)),
 				{x + 46, y + 32}, 13, 0, COL_TEXT_FAINT)

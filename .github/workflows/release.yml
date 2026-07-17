@@ -70,7 +70,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev \
-            libxinerama-dev libxi-dev libgl1-mesa-dev autoconf automake libtool
+            libxinerama-dev libxi-dev libgl1-mesa-dev autoconf automake libtool \
+            libcurl4-openssl-dev
       - name: Statische Audio-Libs bauen (opus, rnnoise, speexdsp)
         run: packaging/ci/build-audio-deps.sh "$HOME/audio-prefix" rnnoise opus speexdsp
       - name: miniaudio (Odin-Vendor) bauen

@@ -29,6 +29,21 @@ User_Rec :: struct {
 	last_seen_ms: i64    `json:"last_seen_ms,omitempty"`,
 	salt:         string `json:"salt"`,      // base64
 	pass_hash:    string `json:"pass_hash"`, // base64
+
+	// Accounts created via an auth provider (empty for password accounts).
+	oauth_provider: string `json:"oauth_provider,omitempty"`,
+	oauth_sub:      string `json:"oauth_sub,omitempty"`,
+}
+
+// Auth provider config (oauth.json). Contains the client_secret — the file
+// is written 0600 like everything else here.
+OAuth_Rec :: struct {
+	id:            string `json:"id"`,
+	enabled:       bool   `json:"enabled,omitempty"`,
+	client_id:     string `json:"client_id,omitempty"`,
+	client_secret: string `json:"client_secret,omitempty"`,
+	issuer:        string `json:"issuer,omitempty"`,
+	label:         string `json:"label,omitempty"`,
 }
 
 Invite_Rec :: struct {
@@ -87,6 +102,10 @@ invites_path :: proc() -> string {
 
 bans_path :: proc() -> string {
 	return fmt.tprintf("%s/bans.json", g.data_dir)
+}
+
+oauth_path :: proc() -> string {
+	return fmt.tprintf("%s/oauth.json", g.data_dir)
 }
 
 messages_path :: proc(channel_id: u64) -> string {
@@ -157,15 +176,17 @@ save_users :: proc() {
 	recs := make([dynamic]User_Rec, 0, len(g.users), context.temp_allocator)
 	for &u in g.users {
 		append(&recs, User_Rec{
-			id           = u.id,
-			username     = u.username,
-			display_name = u.display_name,
-			is_admin     = u.is_admin,
-			disabled     = u.disabled,
-			last_ip      = u.last_ip,
-			last_seen_ms = u.last_seen_ms,
-			salt         = base64.encode(u.salt[:], base64.ENC_TABLE, context.temp_allocator),
-			pass_hash    = base64.encode(u.pass_hash[:], base64.ENC_TABLE, context.temp_allocator),
+			id             = u.id,
+			username       = u.username,
+			display_name   = u.display_name,
+			is_admin       = u.is_admin,
+			disabled       = u.disabled,
+			last_ip        = u.last_ip,
+			last_seen_ms   = u.last_seen_ms,
+			salt           = base64.encode(u.salt[:], base64.ENC_TABLE, context.temp_allocator),
+			pass_hash      = base64.encode(u.pass_hash[:], base64.ENC_TABLE, context.temp_allocator),
+			oauth_provider = u.oauth_provider,
+			oauth_sub      = u.oauth_sub,
 		})
 	}
 	if !save_json_atomic(users_path(), recs[:]) {
@@ -204,6 +225,23 @@ save_bans_locked :: proc() {
 	}
 	if !save_json_atomic(bans_path(), recs[:]) {
 		fmt.printfln("[error] bans.json konnte nicht geschrieben werden")
+	}
+}
+
+save_oauth :: proc() {
+	recs := make([dynamic]OAuth_Rec, 0, len(g.oauth), context.temp_allocator)
+	for &cfg in g.oauth {
+		append(&recs, OAuth_Rec{
+			id            = cfg.id,
+			enabled       = cfg.enabled,
+			client_id     = cfg.client_id,
+			client_secret = cfg.client_secret,
+			issuer        = cfg.issuer,
+			label         = cfg.label,
+		})
+	}
+	if !save_json_atomic(oauth_path(), recs[:]) {
+		fmt.printfln("[error] oauth.json konnte nicht geschrieben werden")
 	}
 }
 
@@ -259,13 +297,15 @@ load_state :: proc() -> bool {
 		}
 		for r in recs {
 			u := User{
-				id           = r.id,
-				username     = strings.clone(r.username),
-				display_name = strings.clone(r.display_name),
-				is_admin     = r.is_admin,
-				disabled     = r.disabled,
-				last_ip      = strings.clone(r.last_ip),
-				last_seen_ms = r.last_seen_ms,
+				id             = r.id,
+				username       = strings.clone(r.username),
+				display_name   = strings.clone(r.display_name),
+				is_admin       = r.is_admin,
+				disabled       = r.disabled,
+				last_ip        = strings.clone(r.last_ip),
+				last_seen_ms   = r.last_seen_ms,
+				oauth_provider = strings.clone(r.oauth_provider),
+				oauth_sub      = strings.clone(r.oauth_sub),
 			}
 			salt, serr := base64.decode(r.salt, base64.DEC_TABLE, nil, context.temp_allocator)
 			hash, herr := base64.decode(r.pass_hash, base64.DEC_TABLE, nil, context.temp_allocator)
@@ -312,6 +352,30 @@ load_state :: proc() -> bool {
 				created_by = r.created_by,
 				used_by    = r.used_by,
 				used_ms    = r.used_ms,
+			})
+		}
+	}
+
+	// oauth.json — unknown provider ids (older/newer versions) are skipped.
+	if os.exists(oauth_path()) {
+		data, err := os.read_entire_file(oauth_path(), context.temp_allocator)
+		recs: []OAuth_Rec
+		if err != nil || json.unmarshal(data, &recs, json.DEFAULT_SPECIFICATION, context.temp_allocator) != nil {
+			fmt.printfln("[error] oauth.json unlesbar")
+			return false
+		}
+		for r in recs {
+			if shared.oauth_preset(r.id) == nil {
+				fmt.printfln("[warn] oauth.json: unbekannter Provider %q übersprungen", r.id)
+				continue
+			}
+			append(&g.oauth, OAuth_Config{
+				id            = shared.oauth_preset(r.id).id, // static preset string
+				enabled       = r.enabled,
+				client_id     = strings.clone(r.client_id),
+				client_secret = strings.clone(r.client_secret),
+				issuer        = strings.clone(r.issuer),
+				label         = strings.clone(r.label),
 			})
 		}
 	}

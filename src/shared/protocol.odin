@@ -48,6 +48,13 @@ K_CALL_MUTE  :: "call_mute" // muted-Flag setzen (nur Anzeige für andere)
 // der Client misst daraus die TCP-Latenz (Indikator in der Kopfzeile).
 K_PING :: "ping"
 
+// OAuth/OIDC login via external identity providers. The server performs the
+// code exchange itself (the client_secret never leaves it); the client only
+// opens the browser and listens on the loopback redirect (RFC 8252).
+// oauth_finish auto-creates an account on first login with a provider.
+K_OAUTH_START  :: "oauth_start"  // provider + redirect_port → auth_url + state
+K_OAUTH_FINISH :: "oauth_finish" // state + code → session (like login)
+
 // Admin panel. All of these require an admin caller; every successful reply
 // carries a fresh Admin_State snapshot so the client never has to sync
 // increments. Server settings changes go through admin_set as a whole.
@@ -61,6 +68,7 @@ K_ADMIN_CREATE_INVITE  :: "admin_create_invite"  // minutes (0 = no expiry)
 K_ADMIN_REVOKE_INVITE  :: "admin_revoke_invite"  // invite_code
 K_ADMIN_BAN_IP         :: "admin_ban_ip"         // ip + minutes (0 = permanent)
 K_ADMIN_UNBAN_IP       :: "admin_unban_ip"       // ip
+K_ADMIN_OAUTH_SET      :: "admin_oauth_set"      // oauth provider config (whole struct)
 
 // Server -> Client Events (seq == 0)
 EV_MESSAGE         :: "ev_message"         // neue Chat-Nachricht
@@ -100,6 +108,24 @@ Admin_Settings :: struct {
 	f2b_ban_min:         int  `json:"f2b_ban_min,omitempty"`,
 }
 
+// Public info about an enabled auth provider (part of server_info, pre-auth).
+OAuth_Provider_Info :: struct {
+	id:    string `json:"id"`,
+	label: string `json:"label"`,
+}
+
+// Full provider config (admin only). `id` picks one of the server's presets
+// (google, github, zitadel, …); issuer is only used by OIDC providers whose
+// preset has no fixed issuer. All fields are absolute — sent as a whole.
+OAuth_Provider_Config :: struct {
+	id:            string `json:"id"`,
+	enabled:       bool   `json:"enabled,omitempty"`,
+	client_id:     string `json:"client_id,omitempty"`,
+	client_secret: string `json:"client_secret,omitempty"`,
+	issuer:        string `json:"issuer,omitempty"`,
+	label:         string `json:"label,omitempty"`, // button label override ("" = preset label)
+}
+
 Invite_Info :: struct {
 	code:       string `json:"code"`,
 	created_ms: i64    `json:"created_ms"`,
@@ -119,10 +145,11 @@ Ban_Info :: struct {
 
 // Admin-only per-user details; joined with the regular user list by id.
 Admin_User :: struct {
-	id:           u64    `json:"id"`,
-	disabled:     bool   `json:"disabled,omitempty"`,
-	last_ip:      string `json:"last_ip,omitempty"`,
-	last_seen_ms: i64    `json:"last_seen_ms,omitempty"`,
+	id:             u64    `json:"id"`,
+	disabled:       bool   `json:"disabled,omitempty"`,
+	last_ip:        string `json:"last_ip,omitempty"`,
+	last_seen_ms:   i64    `json:"last_seen_ms,omitempty"`,
+	oauth_provider: string `json:"oauth_provider,omitempty"`, // account created via this provider
 }
 
 // All non-DM channels, including those the admin is not a member of.
@@ -134,12 +161,13 @@ Admin_Channel :: struct {
 }
 
 Admin_State :: struct {
-	settings: Admin_Settings  `json:"settings"`,
-	users:    []Admin_User    `json:"users,omitempty"`,
-	channels: []Admin_Channel `json:"channels,omitempty"`,
-	invites:  []Invite_Info   `json:"invites,omitempty"`,
-	bans:     []Ban_Info      `json:"bans,omitempty"`,
-	dm_count: int             `json:"dm_count,omitempty"`,
+	settings: Admin_Settings          `json:"settings"`,
+	users:    []Admin_User            `json:"users,omitempty"`,
+	channels: []Admin_Channel         `json:"channels,omitempty"`,
+	invites:  []Invite_Info           `json:"invites,omitempty"`,
+	bans:     []Ban_Info              `json:"bans,omitempty"`,
+	dm_count: int                     `json:"dm_count,omitempty"`,
+	oauth:    []OAuth_Provider_Config `json:"oauth,omitempty"`, // all presets, configured or not
 }
 
 // Teilnehmer eines laufenden Calls.
@@ -196,10 +224,18 @@ Wire :: struct {
 	token:        string `json:"token,omitempty"`,
 
 	// Server-Info
-	server_name:  string `json:"server_name,omitempty"`,
-	initialized:  bool   `json:"initialized,omitempty"`,  // Setup abgeschlossen
-	setup_needed: bool   `json:"setup_needed,omitempty"`, // dieser Client muss Setup durchführen
-	invite_only:  bool   `json:"invite_only,omitempty"`,  // registration requires an invite code
+	server_name:  string                `json:"server_name,omitempty"`,
+	initialized:  bool                  `json:"initialized,omitempty"`,  // Setup abgeschlossen
+	setup_needed: bool                  `json:"setup_needed,omitempty"`, // dieser Client muss Setup durchführen
+	invite_only:  bool                  `json:"invite_only,omitempty"`,  // registration requires an invite code
+	providers:    []OAuth_Provider_Info `json:"providers,omitempty"`,    // enabled auth providers (login buttons)
+
+	// OAuth-Login (oauth_start/oauth_finish; auth_url/state nur in Antworten)
+	provider:      string `json:"provider,omitempty"`,      // provider id (oauth_start)
+	redirect_port: int    `json:"redirect_port,omitempty"`, // loopback port of the client's listener
+	auth_url:      string `json:"auth_url,omitempty"`,      // browser URL (oauth_start reply)
+	state:         string `json:"state,omitempty"`,         // CSRF state (reply + oauth_finish)
+	code:          string `json:"code,omitempty"`,          // authorization code (oauth_finish)
 
 	// Entities
 	user:     User         `json:"user,omitempty"`,
@@ -219,13 +255,14 @@ Wire :: struct {
 	limit:      int    `json:"limit,omitempty"`,
 
 	// Admin / Zugang
-	invite_code: string         `json:"invite_code,omitempty"`, // register + invite management
-	ip:          string         `json:"ip,omitempty"`,
-	minutes:     int            `json:"minutes,omitempty"`, // validity/ban duration (0 = unlimited)
-	is_admin:    bool           `json:"is_admin,omitempty"`,
-	disabled:    bool           `json:"disabled,omitempty"`,
-	settings:    Admin_Settings `json:"settings,omitempty"`,
-	admin:       Admin_State    `json:"admin,omitempty"`,
+	invite_code: string                `json:"invite_code,omitempty"`, // register + invite management
+	ip:          string                `json:"ip,omitempty"`,
+	minutes:     int                   `json:"minutes,omitempty"`, // validity/ban duration (0 = unlimited)
+	is_admin:    bool                  `json:"is_admin,omitempty"`,
+	disabled:    bool                  `json:"disabled,omitempty"`,
+	settings:    Admin_Settings        `json:"settings,omitempty"`,
+	admin:       Admin_State           `json:"admin,omitempty"`,
+	oauth:       OAuth_Provider_Config `json:"oauth,omitempty"`, // admin_oauth_set payload
 
 	// Voice-Calls
 	call:      Call_Info   `json:"call,omitempty"`,      // EV_CALL_STATE / call_join-Reply

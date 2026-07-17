@@ -95,6 +95,7 @@ Server_Conn :: struct {
 	initialized:  bool,
 	setup_needed: bool,
 	invite_only:  bool, // registration requires an invite code
+	providers:    []shared.OAuth_Provider_Info, // enabled auth providers (login buttons)
 
 	// --- nur Main-Thread ---
 	pending:        map[u64]Pending,
@@ -293,6 +294,7 @@ conn_worker :: proc(c: ^Server_Conn, gen: int) {
 	c.initialized = info.initialized
 	c.setup_needed = info.setup_needed
 	c.invite_only = info.invite_only
+	c.providers = info.providers
 
 	// 4. Token vorhanden → Session fortsetzen
 	next_phase := Conn_Phase.Auth_Needed

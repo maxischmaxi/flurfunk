@@ -51,7 +51,13 @@ admin_state_build :: proc() -> shared.Admin_State {
 
 	users := make([]shared.Admin_User, len(g.users), context.temp_allocator)
 	for &u, i in g.users {
-		users[i] = {id = u.id, disabled = u.disabled, last_ip = u.last_ip, last_seen_ms = u.last_seen_ms}
+		users[i] = {
+			id             = u.id,
+			disabled       = u.disabled,
+			last_ip        = u.last_ip,
+			last_seen_ms   = u.last_seen_ms,
+			oauth_provider = u.oauth_provider,
+		}
 	}
 	st.users = users
 
@@ -84,6 +90,7 @@ admin_state_build :: proc() -> shared.Admin_State {
 	st.invites = invites
 
 	st.bans = bans_snapshot()
+	st.oauth = oauth_admin_list()
 	return st
 }
 
@@ -334,5 +341,59 @@ handle_admin_unban_ip :: proc(c: ^Client_Conn, w: shared.Wire) {
 		return
 	}
 	fmt.printfln("[admin] IP %s entsperrt (durch User %d)", w.ip, c.user_id)
+	send_to(c, admin_ok(w))
+}
+
+// Writes one auth provider config as a whole (oauth.json). Enabling
+// requires a complete config — client_id and, for OIDC presets without a
+// fixed issuer, the instance URL.
+handle_admin_oauth_set :: proc(c: ^Client_Conn, w: shared.Wire) {
+	if require_admin(c, w) == nil {
+		return
+	}
+	preset := shared.oauth_preset(strings.trim_space(w.oauth.id))
+	if preset == nil {
+		send_err(c, w.kind, w.seq, "invalid_request")
+		return
+	}
+	client_id := strings.trim_space(w.oauth.client_id)
+	client_secret := strings.trim_space(w.oauth.client_secret)
+	issuer := strings.trim_suffix(strings.trim_space(w.oauth.issuer), "/")
+	label := strings.trim_space(w.oauth.label)
+	if len(client_id) > 512 || len(client_secret) > 512 || len(issuer) > 512 || len(label) > 32 {
+		send_err(c, w.kind, w.seq, "invalid_request")
+		return
+	}
+	if issuer != "" && !strings.has_prefix(issuer, "https://") && !strings.has_prefix(issuer, "http://") {
+		send_err(c, w.kind, w.seq, "invalid_request")
+		return
+	}
+	if w.oauth.enabled {
+		effective := issuer != "" ? issuer : preset.issuer
+		if client_id == "" || (preset.kind == .OIDC && effective == "") {
+			send_err(c, w.kind, w.seq, "oauth_incomplete")
+			return
+		}
+	}
+
+	cfg := find_oauth_cfg(preset.id)
+	if cfg == nil {
+		append(&g.oauth, OAuth_Config{id = preset.id})
+		cfg = &g.oauth[len(g.oauth) - 1]
+	}
+	delete(cfg.client_id)
+	delete(cfg.client_secret)
+	delete(cfg.issuer)
+	delete(cfg.label)
+	cfg.enabled = w.oauth.enabled
+	cfg.client_id = strings.clone(client_id)
+	cfg.client_secret = strings.clone(client_secret)
+	cfg.issuer = strings.clone(issuer)
+	cfg.label = strings.clone(label)
+	save_oauth()
+	oauth_cache_clear(preset.id)
+
+	fmt.printfln("[admin] Auth-Provider %s %s (durch User %d)", preset.id,
+		cfg.enabled ? "aktiviert" : "deaktiviert/gespeichert", c.user_id)
 	send_to(c, admin_ok(w))
 }

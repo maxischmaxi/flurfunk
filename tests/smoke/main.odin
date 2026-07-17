@@ -692,7 +692,105 @@ main :: proc() {
 		"invalid_credentials", "altes passwort tot")
 	must(f2, {kind = shared.K_LOGIN, username = "carol", password = "neu12345"}, "neues passwort gilt")
 
-	// 11) IP-Bans + fail2ban (zum Schluss — sperrt zeitweise die Test-IP)
+	// 11) OAuth-Login gegen einen Fake-OIDC-Provider
+	fake_oidc_start()
+
+	// Aktivieren ohne Konfiguration scheitert; normale User dürfen gar nicht
+	must_err(a, {kind = shared.K_ADMIN_OAUTH_SET, oauth = {id = "oidc", enabled = true}},
+		"oauth_incomplete", "provider aktivieren ohne konfiguration")
+	must_err(b, {kind = shared.K_ADMIN_OAUTH_SET, oauth = {id = "oidc"}},
+		"not_allowed", "oauth-konfiguration braucht admin")
+	oset := must(a, {kind = shared.K_ADMIN_OAUTH_SET, oauth = {
+		id = "oidc", enabled = true, client_id = "test-client",
+		client_secret = "test-secret", issuer = fake_oidc_issuer(), label = "Test-SSO",
+	}}, "oauth provider konfigurieren")
+	ofound := false
+	for p in oset.admin.oauth {
+		if p.id == "oidc" && p.enabled && p.client_id == "test-client" && p.label == "Test-SSO" {
+			ofound = true
+		}
+	}
+	if !ofound {
+		fail("oauth admin-state", "provider fehlt im snapshot")
+	}
+
+	// server_info listet den Provider schon vor der Anmeldung
+	oc := connect(addr, "O")
+	oinfo := request(oc, {kind = shared.K_SERVER_INFO})
+	if len(oinfo.providers) != 1 || oinfo.providers[0].id != "oidc" || oinfo.providers[0].label != "Test-SSO" {
+		fail("server_info providers", "anzahl =", len(oinfo.providers))
+	}
+	step_ok("server_info listet den provider")
+
+	must_err(oc, {kind = shared.K_OAUTH_START, provider = "google", redirect_port = 1234},
+		"unknown_provider", "oauth_start für inaktiven provider")
+
+	// Voller Flow: start → (Browser simuliert der Test) → finish legt das
+	// Konto an — obwohl die Registrierung geschlossen ist.
+	ost := must(oc, {kind = shared.K_OAUTH_START, provider = "oidc", redirect_port = 12345}, "oauth_start")
+	if ost.state == "" || !strings.contains(ost.auth_url, "code_challenge=") ||
+	   !strings.contains(ost.auth_url, "redirect_uri=http%3A%2F%2F127.0.0.1%3A12345%2Fcallback") {
+		fail("oauth_start antwort", "url =", ost.auth_url)
+	}
+	fin := must(oc, {kind = shared.K_OAUTH_FINISH, state = ost.state,
+		code = "sub-1|Mia.Muster|mia@example.com"}, "oauth_finish legt konto an")
+	if fin.token == "" || fin.user.username != "mia.muster" || fin.user.is_admin || fin.setup_needed {
+		fail("oauth-konto", "user =", fin.user.username)
+	}
+	mia_id := fin.user.id
+	mia_token := fin.token
+
+	must_err(oc, {kind = shared.K_OAUTH_FINISH, state = ost.state,
+		code = "sub-1|Mia.Muster|mia@example.com"}, "oauth_expired", "state ist einmalig")
+
+	// Zweiter Login mit derselben sub → gleiches Konto
+	ost2 := must(oc, {kind = shared.K_OAUTH_START, provider = "oidc", redirect_port = 12345}, "oauth_start erneut")
+	fin2 := must(oc, {kind = shared.K_OAUTH_FINISH, state = ost2.state,
+		code = "sub-1|Mia.Muster|mia@example.com"}, "oauth_finish erkennt konto wieder")
+	if fin2.user.id != mia_id {
+		fail("oauth identität", "id =", fin2.user.id, "erwartet", mia_id)
+	}
+
+	// Anderer Provider-Account mit gleichem Wunschnamen → Suffix
+	oc2 := connect(addr, "O2")
+	ost3 := must(oc2, {kind = shared.K_OAUTH_START, provider = "oidc", redirect_port = 23456}, "oauth_start zweiter account")
+	fin3 := must(oc2, {kind = shared.K_OAUTH_FINISH, state = ost3.state,
+		code = "sub-2|Mia.Muster|mia2@example.com"}, "oauth_finish username-dedupe")
+	if fin3.user.username != "mia.muster2" || fin3.user.id == mia_id {
+		fail("username-dedupe", "user =", fin3.user.username)
+	}
+
+	// OAuth-Konten haben kein Passwort; Session-Token funktioniert normal
+	oc3 := connect(addr, "O3")
+	must_err(oc3, {kind = shared.K_LOGIN, username = "mia.muster", password = "egal123"},
+		"invalid_credentials", "passwort-login auf oauth-konto")
+	must(oc3, {kind = shared.K_RESUME, token = mia_token}, "resume mit oauth-token")
+
+	// Deaktiviertes OAuth-Konto kommt nicht mehr rein
+	must(a, {kind = shared.K_ADMIN_SET_DISABLED, user_id = fin3.user.id, disabled = true}, "oauth-konto deaktivieren")
+	oc4 := connect(addr, "O4")
+	ost4 := must(oc4, {kind = shared.K_OAUTH_START, provider = "oidc", redirect_port = 34567}, "oauth_start deaktiviertes konto")
+	must_err(oc4, {kind = shared.K_OAUTH_FINISH, state = ost4.state,
+		code = "sub-2|Mia.Muster|mia2@example.com"}, "user_disabled", "oauth-login deaktiviertes konto")
+
+	// Provider deaktivieren: Buttons verschwinden, offene States sterben
+	ost5 := must(oc4, {kind = shared.K_OAUTH_START, provider = "oidc", redirect_port = 34567}, "oauth_start vor provider-deaktivierung")
+	must(a, {kind = shared.K_ADMIN_OAUTH_SET, oauth = {
+		id = "oidc", client_id = "test-client", client_secret = "test-secret",
+		issuer = fake_oidc_issuer(), label = "Test-SSO",
+	}}, "provider deaktivieren")
+	oc5 := connect(addr, "O5")
+	oinfo2 := request(oc5, {kind = shared.K_SERVER_INFO})
+	if len(oinfo2.providers) != 0 {
+		fail("provider nach deaktivierung", "anzahl =", len(oinfo2.providers))
+	}
+	step_ok("server_info ohne provider nach deaktivierung")
+	must_err(oc4, {kind = shared.K_OAUTH_FINISH, state = ost5.state, code = "sub-2|x|y"},
+		"unknown_provider", "oauth_finish nach provider-deaktivierung")
+	// Zähler der Test-IP leeren (die fail2ban-Sektion braucht einen sauberen Stand)
+	must(connect(addr, "O6"), {kind = shared.K_RESUME, token = mia_token}, "resume räumt fail-zähler")
+
+	// 12) IP-Bans + fail2ban (zum Schluss — sperrt zeitweise die Test-IP)
 	must_err(a, {kind = shared.K_ADMIN_BAN_IP, ip = "127.0.0.1"}, "own_ip", "eigene ip nicht sperrbar")
 	must_err(a, {kind = shared.K_ADMIN_BAN_IP, ip = "kein-ip"}, "invalid_request", "kaputte ip abgelehnt")
 	bn := must(a, {kind = shared.K_ADMIN_BAN_IP, ip = "203.0.113.7", minutes = 30}, "fremde ip sperren")

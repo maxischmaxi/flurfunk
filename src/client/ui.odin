@@ -304,6 +304,7 @@ draw_auth :: proc(app: ^App, c: ^Server_Conn, chat: rl.Rectangle) {
 	fresh := !c.initialized // frischer Server → nur Registrieren, erster User wird Admin
 	register := fresh || c.auth_tab == 1
 	need_invite := register && !fresh && c.invite_only
+	provs := c.providers
 
 	h := f32(register ? 424 : 372)
 	if fresh {
@@ -311,6 +312,9 @@ draw_auth :: proc(app: ^App, c: ^Server_Conn, chat: rl.Rectangle) {
 	}
 	if need_invite {
 		h += 72
+	}
+	if len(provs) > 0 {
+		h += 26 + f32(len(provs)) * 48
 	}
 	p := card_frame(app, chat, 420, h)
 
@@ -424,6 +428,35 @@ draw_auth :: proc(app: ^App, c: ^Server_Conn, chat: rl.Rectangle) {
 
 	if c.auth_error != "" {
 		draw_text_centered(app.fonts.regular13, c.auth_error, p.x + p.width/2, y, 13, COL_RED)
+	}
+
+	// Auth-Provider-Buttons („Weiter mit Google/…"), sofern der Server
+	// welche aktiviert hat. Ein Klick startet den Browser-Flow; ein
+	// erneuter Klick auf den laufenden Provider bricht ihn ab.
+	if len(provs) > 0 {
+		y += 20
+		cx := p.x + p.width/2
+		lbl := "oder weiter mit"
+		tw := rl.MeasureTextEx(app.fonts.regular13, tcstr(lbl), 13, 0).x
+		rl.DrawLineEx({field_x, y + 7}, {cx - tw/2 - 10, y + 7}, 1, COL_BORDER_SOFT)
+		rl.DrawLineEx({cx + tw/2 + 10, y + 7}, {field_x + field_w, y + 7}, 1, COL_BORDER_SOFT)
+		draw_text_centered(app.fonts.regular13, lbl, cx, y, 13, COL_TEXT_FAINT)
+		y += 26
+
+		flow := &app.oauth
+		for prov, i in provs {
+			busy_this := flow.active && flow.conn == c && flow.provider == prov.id
+			label := busy_this ? "Warte auf den Browser… (abbrechen)" : fmt.tprintf("Mit %s anmelden", prov.label)
+			if button(app, {field_x, y, field_w, 40}, label, .Base, id_salt = 0x0A07 ~ (u64(i + 1) << 32)) && !c.auth_busy {
+				if busy_this {
+					oauth_flow_stop(app)
+					toast(app, .Info, "Anmeldung abgebrochen")
+				} else {
+					oauth_begin(app, c, prov.id, prov.label)
+				}
+			}
+			y += 48
+		}
 	}
 
 	if submitted && !c.auth_busy {
@@ -560,6 +593,10 @@ app_remove_server :: proc(app: ^App, idx: int) {
 	// Hängt der aktive Call an diesem Server → lokal beenden
 	if app.call.active && app.call.conn == c {
 		call_teardown(app)
+	}
+	// Laufender OAuth-Flow zu diesem Server → abbrechen
+	if app.oauth.active && app.oauth.conn == c {
+		oauth_flow_stop(app)
 	}
 
 	// Reader-Thread (falls noch aktiv) über Generation invalidieren

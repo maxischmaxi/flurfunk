@@ -38,6 +38,21 @@ send_err :: proc(c: ^Client_Conn, kind: string, seq: u64, code: string) {
 
 // Zentrale Dispatch-Funktion für eine empfangene Wire-Nachricht.
 handle_wire :: proc(c: ^Client_Conn, w: shared.Wire) {
+	// The OAuth handlers run WITHOUT the global lock — they perform outbound
+	// HTTP requests that must not stall the whole server (oauth.odin).
+	switch w.kind {
+	case shared.K_OAUTH_START, shared.K_OAUTH_FINISH:
+		if !oauth_budget_ok(c) {
+			return
+		}
+		if w.kind == shared.K_OAUTH_START {
+			handle_oauth_start(c, w)
+		} else {
+			handle_oauth_finish(c, w)
+		}
+		return
+	}
+
 	sync.lock(&g.mu)
 	defer sync.unlock(&g.mu)
 
@@ -125,6 +140,8 @@ handle_wire :: proc(c: ^Client_Conn, w: shared.Wire) {
 			handle_admin_ban_ip(c, w)
 		case shared.K_ADMIN_UNBAN_IP:
 			handle_admin_unban_ip(c, w)
+		case shared.K_ADMIN_OAUTH_SET:
+			handle_admin_oauth_set(c, w)
 		case:
 			send_err(c, w.kind, w.seq, "invalid_request")
 		}
@@ -139,6 +156,7 @@ handle_server_info :: proc(c: ^Client_Conn, w: shared.Wire) {
 	resp.initialized = g.meta.initialized
 	resp.setup_needed = !g.meta.initialized
 	resp.invite_only = g.meta.initialized && g.meta.registration_closed
+	resp.providers = oauth_public_list()
 	send_to(c, resp)
 }
 
@@ -240,6 +258,14 @@ handle_register :: proc(c: ^Client_Conn, w: shared.Wire) {
 handle_login :: proc(c: ^Client_Conn, w: shared.Wire) {
 	u := find_user_by_name(strings.trim_space(w.username))
 	if u == nil {
+		if security_fail(c.ip) {
+			c.drop = true
+		}
+		send_err(c, w.kind, w.seq, "invalid_credentials")
+		return
+	}
+	// OAuth-only accounts have no password — don't even run Argon2.
+	if u.oauth_provider != "" && user_password_missing(u) {
 		if security_fail(c.ip) {
 			c.drop = true
 		}

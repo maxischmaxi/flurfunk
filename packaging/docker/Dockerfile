@@ -4,6 +4,11 @@
 # placed next to the Dockerfile.
 FROM debian:bookworm-slim
 
+# libcurl + CA bundle: the server talks HTTPS to OAuth providers.
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends libcurl4 ca-certificates \
+	&& rm -rf /var/lib/apt/lists/*
+
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="flurfunk-server" \
       org.opencontainers.image.description="Selbst gehosteter Team-Chat mit Voice-Calls — Server" \

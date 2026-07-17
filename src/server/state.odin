@@ -26,6 +26,22 @@ User :: struct {
 	last_seen_ms: i64,
 	salt:         [SALT_LEN]byte,
 	pass_hash:    [HASH_LEN]byte,
+
+	// Accounts created via an auth provider: identified by (provider, sub).
+	// Their salt/pass_hash stay zero until an admin sets a password.
+	oauth_provider: string,
+	oauth_sub:      string,
+}
+
+// One configured auth provider (persisted in oauth.json; see oauth.odin).
+// `id` matches an entry of shared.OAUTH_PRESETS.
+OAuth_Config :: struct {
+	id:            string,
+	enabled:       bool,
+	client_id:     string,
+	client_secret: string,
+	issuer:        string, // instance URL override ("" = preset default)
+	label:         string, // button label override ("" = preset label)
 }
 
 // Invite code for registering while the server is closed.
@@ -96,6 +112,7 @@ Server_State :: struct {
 	sessions:   [dynamic]Session,
 	channels:   [dynamic]Channel,
 	invites:    [dynamic]Invite,
+	oauth:      [dynamic]OAuth_Config,
 	conns:      [dynamic]^Client_Conn,
 
 	// Offene Bearbeitungs-Freigaben (message_id → user_id). edit_start prüft
@@ -151,6 +168,33 @@ find_invite :: proc(code: string) -> ^Invite {
 		}
 	}
 	return nil
+}
+
+find_oauth_cfg :: proc(id: string) -> ^OAuth_Config {
+	for &cfg in g.oauth {
+		if cfg.id == id {
+			return &cfg
+		}
+	}
+	return nil
+}
+
+find_user_by_oauth :: proc(provider, sub: string) -> ^User {
+	if sub == "" {
+		return nil
+	}
+	for &u in g.users {
+		if u.oauth_provider == provider && u.oauth_sub == sub {
+			return &u
+		}
+	}
+	return nil
+}
+
+// True for accounts that (still) have no password at all (OAuth-only).
+user_password_missing :: proc(u: ^User) -> bool {
+	zero: [HASH_LEN]byte
+	return u.pass_hash == zero
 }
 
 // Drops all sessions of one user (password reset/deactivation).

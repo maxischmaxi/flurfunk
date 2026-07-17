@@ -59,6 +59,13 @@ wenig Speicher und fühlen sich auch bei großen Verläufen flüssig an.
   Admin vorab angelegten Konto hinein. Dazu Brute-Force-Schutz
   (Fail2ban-Prinzip) und IP-Sperren, die schon vor dem Krypto-Handshake
   greifen.
+- **Login über Google, GitHub & Co. (SSO)** — Admins aktivieren Auth-
+  Provider im Panel: Google, GitHub, GitLab, Microsoft, Discord, Slack,
+  Zitadel, Keycloak, Authentik, Okta, Auth0 oder ein beliebiger
+  OpenID-Connect-Provider. Auf der Anmeldeseite erscheint dann ein
+  Button; beim ersten Login entsteht das Konto automatisch — auch bei
+  geschlossener Registrierung. Der Login läuft im Browser (PKCE), das
+  Client-Secret bleibt auf dem Server.
 - **Alles Erwartbare** — Ungelesen-Badges, Online-Presence,
   „Neu"-Trennlinie, Schnellsuche (`Strg+K`), Latenz-Anzeige,
   Auto-Reconnect, Text markieren und kopieren wie im Browser.
@@ -91,8 +98,9 @@ yay -S flurfunk-bin        # oder: paru -S flurfunk-bin
 flatpak install --user ./flurfunk-<version>-x86_64.flatpak
 ```
 
-**Tarball**: laden und entpacken — die Binaries brauchen nur glibc und
-X11, alle Audio-Bibliotheken sind bereits enthalten:
+**Tarball**: laden und entpacken — die Binaries brauchen nur glibc, X11
+und libcurl (Server, für den SSO-Login), alle Audio-Bibliotheken sind
+bereits enthalten:
 
 ```sh
 tar xf flurfunk-<version>-linux-x86_64.tar.gz
@@ -135,6 +143,11 @@ hinein. Unter **Sicherheit** sperrt der eingebaute Brute-Force-Schutz
 Angreifer-IPs automatisch aus; einzelne IP-Adressen lassen sich auch von
 Hand sperren. Gesperrte Adressen werden bereits **vor** dem
 Verschlüsselungs-Handshake abgewiesen, auf TCP wie UDP.
+
+Unter **Anmeldung** lassen sich Auth-Provider (Google, GitHub, Zitadel,
+beliebiges OIDC …) aktivieren — das Team meldet sich dann per Browser-SSO
+an, Konten entstehen beim ersten Login automatisch. Einrichtung pro
+Provider: [docs/AUTH-PROVIDERS.md](docs/AUTH-PROVIDERS.md).
 
 Der Master-Schlüssel (`master.key`) lässt sich per `-key` auf ein
 separates Medium legen — dann sind Daten und Schlüssel physisch getrennt.

@@ -8,7 +8,8 @@ arch=('x86_64')
 url="https://github.com/maxischmaxi/flurfunk"
 license=('MIT')
 # Audio libs (opus, rnnoise, speexdsp) are statically linked.
-depends=('glibc' 'libx11')
+# curl: the server talks to OAuth providers via libcurl.
+depends=('glibc' 'libx11' 'curl')
 provides=('flurfunk')
 conflicts=('flurfunk')
 source=("https://github.com/maxischmaxi/flurfunk/releases/download/v${pkgver}/flurfunk-${pkgver}-linux-x86_64.tar.gz")

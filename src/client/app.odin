@@ -106,6 +106,9 @@ App :: struct {
 	welcome_input: Text_Input,
 	welcome_error: string,
 
+	// OAuth login flow (oauth.odin): loopback listener + browser handoff
+	oauth: OAuth_Flow,
+
 	// Admin panel (adminui.odin): tab, inputs and inline confirmations.
 	adm_tab:         int,
 	adm_name_input:  Text_Input, // server name (general tab)
@@ -118,6 +121,13 @@ App :: struct {
 	adm_reset_user:  u64,        // password reset: open row (0 = none)
 	adm_reset_input: Text_Input,
 	adm_confirm_del: u64, // channels tab: two-step delete (channel id)
+
+	// Login tab: expanded provider (index into shared.OAUTH_PRESETS, -1 = none)
+	adm_oauth_sel: int,
+	adm_oa_client: Text_Input,
+	adm_oa_secret: Text_Input,
+	adm_oa_issuer: Text_Input,
+	adm_oa_label:  Text_Input,
 
 	tz: ^datetime.TZ_Region, // lokale Zeitzone (nil → UTC)
 }
@@ -270,6 +280,7 @@ app_poll :: proc(app: ^App) {
 	}
 	call_tick(app)          // Voice: Keepalive/HELLO-Retries, Trennung erkennen
 	settings_test_tick(app) // Audio-Tests: Ton-Ende, Test-Mute zurücknehmen
+	oauth_tick(app)         // OAuth: Browser-Redirect einsammeln, Timeout
 }
 
 conn_label :: proc(c: ^Server_Conn) -> string {
@@ -416,7 +427,10 @@ app_apply_wire :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, is_active_ser
 @(private = "file")
 app_apply_reply :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, p: Pending) {
 	switch p.kind {
-	case shared.K_LOGIN, shared.K_REGISTER:
+	case shared.K_OAUTH_START:
+		oauth_url_ready(app, c, w)
+
+	case shared.K_LOGIN, shared.K_REGISTER, shared.K_OAUTH_FINISH:
 		c.auth_busy = false
 		if !w.ok {
 			c.auth_error = strings.clone(translate_err(w.err))
@@ -595,7 +609,7 @@ app_apply_reply :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, p: Pending) 
 	     shared.K_ADMIN_SET_DISABLED, shared.K_ADMIN_CREATE_USER,
 	     shared.K_ADMIN_RESET_PASSWORD, shared.K_ADMIN_CREATE_INVITE,
 	     shared.K_ADMIN_REVOKE_INVITE, shared.K_ADMIN_BAN_IP,
-	     shared.K_ADMIN_UNBAN_IP:
+	     shared.K_ADMIN_UNBAN_IP, shared.K_ADMIN_OAUTH_SET:
 		admin_apply_reply(app, c, w, p)
 
 	case shared.K_MESSAGE_HISTORY:
@@ -843,6 +857,14 @@ translate_err :: proc(code: string) -> string {
 		return "Der letzte Administrator kann nicht entfernt werden"
 	case "own_ip":
 		return "Das ist deine eigene IP-Adresse"
+	case "unknown_provider":
+		return "Dieser Anmeldedienst ist nicht (mehr) aktiviert"
+	case "oauth_failed":
+		return "Anmeldung beim Anbieter fehlgeschlagen"
+	case "oauth_expired":
+		return "Anmeldung abgelaufen — bitte erneut versuchen"
+	case "oauth_incomplete":
+		return "Konfiguration unvollständig (Client-ID bzw. Issuer fehlt)"
 	}
 	return fmt.tprintf("Fehler: %s", code)
 }

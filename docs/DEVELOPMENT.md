@@ -9,7 +9,9 @@ gemeinsames Protokoll-Package liegen zusammen.
 
 Voraussetzungen: Odin (getestet mit `dev-2026-07`) im `PATH` sowie für
 die Voice-Calls die Systembibliotheken **libopus**, **librnnoise** und
-**libspeexdsp** (Arch: `pacman -S opus rnnoise speexdsp`). `build.sh`
+**libspeexdsp** (Arch: `pacman -S opus rnnoise speexdsp`). Der Server
+linkt zusätzlich gegen **libcurl** (OAuth-Login; Arch: `curl`, Debian:
+`libcurl4-openssl-dev`, macOS: im System enthalten). `build.sh`
 kompiliert das miniaudio-`.a` aus dem Odin-Vendor beim ersten Lauf
 automatisch (braucht `cc`/`make`).
 

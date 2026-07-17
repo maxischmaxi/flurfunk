@@ -38,6 +38,10 @@ Focus :: enum {
 	Adm_Pass,
 	Adm_Ban,
 	Adm_Reset,
+	Adm_OA_Client,
+	Adm_OA_Secret,
+	Adm_OA_Issuer,
+	Adm_OA_Label,
 }
 
 // Ein per Tab erreichbares Widget. Die Registrierungs-Reihenfolge

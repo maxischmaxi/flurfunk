@@ -62,6 +62,24 @@ main :: proc() {
 	}
 	fmt.println("ok: login nach neustart, servername erhalten")
 
+	// OAuth: Konto (ohne Passwort) und Provider-Konfiguration überleben den
+	// Neustart (users.json/oauth.json aus dem Smoke-Test)
+	pw := request(&conn, &seq, {kind = shared.K_LOGIN, username = "mia.muster", password = "egal123"})
+	if pw.ok || pw.err != "invalid_credentials" {
+		fail("oauth-konto nach neustart", "err =", pw.err)
+	}
+	as := request(&conn, &seq, {kind = shared.K_ADMIN_STATE})
+	oauth_ok := false
+	for p in as.admin.oauth {
+		if p.id == "oidc" && !p.enabled && p.client_id == "test-client" && p.label == "Test-SSO" {
+			oauth_ok = true
+		}
+	}
+	if !as.ok || !oauth_ok {
+		fail("oauth-konfiguration nach neustart")
+	}
+	fmt.println("ok: oauth-konto und provider-konfiguration nach neustart")
+
 	lc := request(&conn, &seq, {kind = shared.K_LIST_CHANNELS})
 	if len(lc.channels) != 5 { // general + DM + büro-küche + bulk + edits (aus dem Smoke-Test)
 		fail("channels nach neustart", "erwartet 5, bekommen", len(lc.channels))

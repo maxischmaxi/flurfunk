@@ -190,6 +190,7 @@ main :: proc() {
 	if !load_state() {
 		os.exit(1)
 	}
+	http_init() // libcurl global init (before any threads exist)
 
 	// Fingerprint des öffentlichen Noise-Keys (für TOFU-Pinning der Clients).
 	pub: [shared.STATIC_KEY_SIZE]byte
