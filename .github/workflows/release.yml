@@ -244,13 +244,15 @@ jobs:
           gh release download "$GITHUB_REF_NAME" \
             --pattern "flurfunk-$version-linux-x86_64.tar.gz" --dir /tmp/rel
           sha="$(sha256sum /tmp/rel/*.tar.gz | cut -d' ' -f1)"
+          # Into the workspace — the deploy action runs in a Docker container
+          # that mounts the workspace but not the runner's /tmp.
           sed -e "s/@VERSION@/$version/g" -e "s/@SHA256@/$sha/g" \
-            packaging/aur/PKGBUILD.in > /tmp/PKGBUILD
-          cat /tmp/PKGBUILD
+            packaging/aur/PKGBUILD.in > PKGBUILD
+          cat PKGBUILD
       - uses: KSXGitHub/github-actions-deploy-aur@v4.2.0
         with:
           pkgname: flurfunk-bin
-          pkgbuild: /tmp/PKGBUILD
+          pkgbuild: ./PKGBUILD
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
