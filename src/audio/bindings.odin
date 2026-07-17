@@ -10,7 +10,12 @@ import "core:c"
 
 // ---------- libopus ----------
 
-foreign import opus_lib "system:opus"
+// Windows' MSVC linker needs the .lib suffix; on Unix `system:` maps to -lopus.
+when ODIN_OS == .Windows {
+	foreign import opus_lib "system:opus.lib"
+} else {
+	foreign import opus_lib "system:opus"
+}
 
 Opus_Encoder :: struct {}
 Opus_Decoder :: struct {}
@@ -42,7 +47,11 @@ foreign opus_lib {
 
 // ---------- librnnoise ----------
 
-foreign import rnnoise_lib "system:rnnoise"
+when ODIN_OS == .Windows {
+	foreign import rnnoise_lib "system:rnnoise.lib"
+} else {
+	foreign import rnnoise_lib "system:rnnoise"
+}
 
 Denoise_State :: struct {}
 
@@ -58,7 +67,11 @@ foreign rnnoise_lib {
 
 // ---------- libspeexdsp (nur AEC) ----------
 
-foreign import speexdsp_lib "system:speexdsp"
+when ODIN_OS == .Windows {
+	foreign import speexdsp_lib "system:speexdsp.lib"
+} else {
+	foreign import speexdsp_lib "system:speexdsp"
+}
 
 Speex_Echo_State :: struct {}
 
