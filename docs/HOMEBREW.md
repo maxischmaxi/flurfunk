@@ -1,5 +1,19 @@
 # Flurfunk auf Homebrew veröffentlichen
 
+> **Status: eingerichtet (2026-07-17).** Das Tap
+> [`maxischmaxi/homebrew-tap`](https://github.com/maxischmaxi/homebrew-tap)
+> existiert, die Formula für v0.1.1 liegt drin, und die Release-Pipeline
+> aktualisiert sie ab jetzt automatisch (Deploy-Key als Secret
+> `HOMEBREW_TAP_SSH_KEY`, privater Teil unter `~/.ssh/tap_flurfunk`).
+> Installation:
+>
+> ```sh
+> brew install maxischmaxi/tap/flurfunk
+> ```
+>
+> Der Rest dieses Dokuments beschreibt die Einrichtung (als Referenz)
+> und den späteren Weg in homebrew-core.
+
 Homebrew kennt zwei Wege: einen **eigenen Tap** (sofort machbar, volle
 Kontrolle) und **homebrew-core** (das offizielle Verzeichnis, mit
 Aufnahmekriterien). Für den Start nimmst du den Tap — homebrew-core kommt
@@ -69,19 +83,24 @@ Beide Binaries (`flurfunk` und `flurfunk-server`) landen in `$PATH`.
 Die Audio-Bibliotheken sind statisch eingelinkt — die Formula hat keine
 Laufzeit-Abhängigkeiten.
 
-### Schritt 5 (optional, ab dem zweiten Release): Automatisieren
+### Schritt 5: Automatisieren (✅ erledigt)
 
-Die Release-Pipeline enthält bereits einen `homebrew`-Job, der die
-Formula im Tap automatisch aktualisiert, sobald das Secret
-`HOMEBREW_TAP_TOKEN` existiert:
+Die Release-Pipeline enthält einen `homebrew`-Job, der die Formula im
+Tap automatisch aktualisiert. Er authentifiziert sich über einen
+**Deploy-Key** des Tap-Repos (PATs lassen sich nicht per API erstellen;
+ein Deploy-Key ist ohnehin enger gescoped — nur dieses eine Repo, nur
+Push, kein Ablaufdatum):
 
-1. Fine-grained Personal Access Token erstellen
-   (github.com → Settings → Developer settings → Fine-grained tokens):
-   nur Repo `maxischmaxi/homebrew-tap`, Permission „Contents:
-   Read and write".
-2. Als Secret hinterlegen:
+1. Schlüsselpaar erzeugen und den öffentlichen Teil als Deploy-Key mit
+   Schreibrecht hinterlegen:
    ```sh
-   gh secret set HOMEBREW_TAP_TOKEN --repo maxischmaxi/flurfunk
+   ssh-keygen -t ed25519 -N "" -f ~/.ssh/tap_flurfunk
+   gh repo deploy-key add ~/.ssh/tap_flurfunk.pub \
+     -R maxischmaxi/homebrew-tap --allow-write -t "flurfunk release CI"
+   ```
+2. Den privaten Teil als Secret hinterlegen:
+   ```sh
+   gh secret set HOMEBREW_TAP_SSH_KEY -R maxischmaxi/flurfunk < ~/.ssh/tap_flurfunk
    ```
 
 Ab dann pflegt jedes Release den Tap selbst; die Schritte 3–4 entfallen.

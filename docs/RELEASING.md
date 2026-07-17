@@ -42,10 +42,11 @@ Key** → Inhalt von `~/.ssh/aur_flurfunk.pub` eintragen und speichern.
 Mehr ist nicht nötig: Der erste Push der Pipeline legt die Paketbasis
 `flurfunk-bin` im AUR automatisch an.
 
-### 3. Homebrew-Tap (optional, empfohlen)
+### 3. Homebrew-Tap (✅ eingerichtet)
 
-Siehe [HOMEBREW.md](HOMEBREW.md) — einmalig Tap-Repo anlegen; mit dem
-Secret `HOMEBREW_TAP_TOKEN` aktualisiert die Pipeline die Formula selbst.
+Das Tap `maxischmaxi/homebrew-tap` existiert, die Pipeline aktualisiert
+die Formula über den Deploy-Key im Secret `HOMEBREW_TAP_SSH_KEY`
+(privater Teil: `~/.ssh/tap_flurfunk`). Details: [HOMEBREW.md](HOMEBREW.md).
 
 ### 4. macOS-Signierung und Notarisierung (optional, empfohlen)
 
@@ -84,7 +85,7 @@ Gatekeeper-Warnung mehr.
 |--------|---------|-------|--------|
 | `AUR_SSH_PRIVATE_KEY` | für AUR | Push nach aur.archlinux.org | ✅ gesetzt |
 | `AUR_USERNAME` / `AUR_EMAIL` | für AUR | Commit-Autor der AUR-Commits | ✅ gesetzt |
-| `HOMEBREW_TAP_TOKEN` | optional | Formula im Tap aktualisieren | ⬜ |
+| `HOMEBREW_TAP_SSH_KEY` | für Homebrew | Deploy-Key: Formula im Tap aktualisieren | ✅ gesetzt |
 | `MACOS_CERT_P12` / `MACOS_CERT_PASSWORD` | optional | Developer-ID-Signierung | ⬜ |
 | `APPLE_ID` / `APPLE_TEAM_ID` / `APPLE_APP_PASSWORD` | optional | Notarisierung | ⬜ |
 
