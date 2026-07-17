@@ -24,8 +24,28 @@ User_Rec :: struct {
 	username:     string `json:"username"`,
 	display_name: string `json:"display_name"`,
 	is_admin:     bool   `json:"is_admin"`,
+	disabled:     bool   `json:"disabled,omitempty"`,
+	last_ip:      string `json:"last_ip,omitempty"`,
+	last_seen_ms: i64    `json:"last_seen_ms,omitempty"`,
 	salt:         string `json:"salt"`,      // base64
 	pass_hash:    string `json:"pass_hash"`, // base64
+}
+
+Invite_Rec :: struct {
+	code:       string `json:"code"`,
+	created_ms: i64    `json:"created_ms"`,
+	expires_ms: i64    `json:"expires_ms,omitempty"`,
+	created_by: u64    `json:"created_by"`,
+	used_by:    u64    `json:"used_by,omitempty"`,
+	used_ms:    i64    `json:"used_ms,omitempty"`,
+}
+
+Ban_Rec :: struct {
+	ip:         string `json:"ip"`,
+	reason:     string `json:"reason,omitempty"`,
+	created_ms: i64    `json:"created_ms"`,
+	expires_ms: i64    `json:"expires_ms,omitempty"`,
+	by_user:    u64    `json:"by_user,omitempty"`,
 }
 
 Session_Rec :: struct {
@@ -59,6 +79,14 @@ sessions_path :: proc() -> string {
 
 channels_path :: proc() -> string {
 	return fmt.tprintf("%s/channels.json", g.data_dir)
+}
+
+invites_path :: proc() -> string {
+	return fmt.tprintf("%s/invites.json", g.data_dir)
+}
+
+bans_path :: proc() -> string {
+	return fmt.tprintf("%s/bans.json", g.data_dir)
 }
 
 messages_path :: proc(channel_id: u64) -> string {
@@ -133,12 +161,49 @@ save_users :: proc() {
 			username     = u.username,
 			display_name = u.display_name,
 			is_admin     = u.is_admin,
+			disabled     = u.disabled,
+			last_ip      = u.last_ip,
+			last_seen_ms = u.last_seen_ms,
 			salt         = base64.encode(u.salt[:], base64.ENC_TABLE, context.temp_allocator),
 			pass_hash    = base64.encode(u.pass_hash[:], base64.ENC_TABLE, context.temp_allocator),
 		})
 	}
 	if !save_json_atomic(users_path(), recs[:]) {
 		fmt.printfln("[error] users.json konnte nicht geschrieben werden")
+	}
+}
+
+save_invites :: proc() {
+	recs := make([dynamic]Invite_Rec, 0, len(g.invites), context.temp_allocator)
+	for &inv in g.invites {
+		append(&recs, Invite_Rec{
+			code       = inv.code,
+			created_ms = inv.created_ms,
+			expires_ms = inv.expires_ms,
+			created_by = inv.created_by,
+			used_by    = inv.used_by,
+			used_ms    = inv.used_ms,
+		})
+	}
+	if !save_json_atomic(invites_path(), recs[:]) {
+		fmt.printfln("[error] invites.json konnte nicht geschrieben werden")
+	}
+}
+
+// Persists the ban list; call with g_bans.mu held.
+save_bans_locked :: proc() {
+	recs := make([dynamic]Ban_Rec, 0, len(g_bans.bans), context.temp_allocator)
+	for &b in g_bans.bans {
+		append(&recs, Ban_Rec{
+			ip         = b.ip,
+			reason     = b.reason,
+			created_ms = b.created_ms,
+			expires_ms = b.expires_ms,
+			by_user    = b.by_user,
+		})
+	}
+	if !save_json_atomic(bans_path(), recs[:]) {
+		fmt.printfln("[error] bans.json konnte nicht geschrieben werden")
 	}
 }
 
@@ -198,6 +263,9 @@ load_state :: proc() -> bool {
 				username     = strings.clone(r.username),
 				display_name = strings.clone(r.display_name),
 				is_admin     = r.is_admin,
+				disabled     = r.disabled,
+				last_ip      = strings.clone(r.last_ip),
+				last_seen_ms = r.last_seen_ms,
 			}
 			salt, serr := base64.decode(r.salt, base64.DEC_TABLE, nil, context.temp_allocator)
 			hash, herr := base64.decode(r.pass_hash, base64.DEC_TABLE, nil, context.temp_allocator)
@@ -227,6 +295,50 @@ load_state :: proc() -> bool {
 			})
 		}
 	}
+
+	// invites.json
+	if os.exists(invites_path()) {
+		data, err := os.read_entire_file(invites_path(), context.temp_allocator)
+		recs: []Invite_Rec
+		if err != nil || json.unmarshal(data, &recs, json.DEFAULT_SPECIFICATION, context.temp_allocator) != nil {
+			fmt.printfln("[error] invites.json unlesbar")
+			return false
+		}
+		for r in recs {
+			append(&g.invites, Invite{
+				code       = strings.clone(r.code),
+				created_ms = r.created_ms,
+				expires_ms = r.expires_ms,
+				created_by = r.created_by,
+				used_by    = r.used_by,
+				used_ms    = r.used_ms,
+			})
+		}
+	}
+
+	// bans.json — expired bans are dropped on load.
+	if os.exists(bans_path()) {
+		data, err := os.read_entire_file(bans_path(), context.temp_allocator)
+		recs: []Ban_Rec
+		if err != nil || json.unmarshal(data, &recs, json.DEFAULT_SPECIFICATION, context.temp_allocator) != nil {
+			fmt.printfln("[error] bans.json unlesbar")
+			return false
+		}
+		now := now_ms()
+		for r in recs {
+			if r.expires_ms > 0 && r.expires_ms <= now {
+				continue
+			}
+			append(&g_bans.bans, Ban{
+				ip         = strings.clone(r.ip),
+				reason     = strings.clone(r.reason),
+				created_ms = r.created_ms,
+				expires_ms = r.expires_ms,
+				by_user    = r.by_user,
+			})
+		}
+	}
+	security_configure(g.meta)
 
 	// channels.json — Channel-Keys mit dem Master-Key entpacken.
 	if os.exists(channels_path()) {

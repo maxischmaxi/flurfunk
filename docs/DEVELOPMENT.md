@@ -96,6 +96,27 @@ serverseitig verschlüsselt lagern.
   Schlüssel physisch getrennt.
 - **Passwörter:** Argon2id (64 MiB, 3 Passes) mit zufälligem Salt.
 - **Sitzungen:** zufällige 256-Bit-Tokens.
+- **Zugangskontrolle:** Wer sich als erste Person registriert, wird
+  Administrator. Der Admin kann die Registrierung schließen — danach
+  kommen neue Konten nur über einmalige Einladungscodes (8 Zeichen,
+  kryptografisch zufällig, optional befristet) oder vorab angelegte
+  Konten herein. Der Invite-Check läuft **vor** dem Argon2-Hashing,
+  Fehlversuche kosten den Server praktisch nichts.
+- **Brute-Force-Schutz (Fail2ban-Prinzip):** Fehlgeschlagene
+  Anmelde-/Registrierungsversuche werden pro IP gezählt; wer das
+  konfigurierbare Limit im Zeitfenster reißt, wird temporär gesperrt
+  (Default: 5 Fehler / 15 min → 30 min Sperre). Admins können IPs
+  zusätzlich manuell sperren (temporär oder permanent, `bans.json`).
+  Gesperrte IPs werden am TCP-Accept **vor dem Noise-Handshake**
+  verworfen und im UDP-Pfad vor jeglichem Parsen — ein Angreifer kann
+  den Server nicht einmal Krypto-Arbeit kosten. Zusätzlich hat jede
+  Verbindung vor der Anmeldung ein hartes Request-Budget gegen
+  Pre-Auth-Spam.
+- **Konten-Verwaltung:** Deaktivierte Konten können sich nicht anmelden,
+  ihre Sitzungen und offenen Verbindungen werden sofort beendet.
+  Passwort-Resets durch den Admin invalidieren alle Sitzungen des
+  betroffenen Kontos. Der letzte aktive Admin ist gegen Degradierung
+  und Deaktivierung geschützt.
 
 Bewusste MVP-Grenze: Der laufende Server kann Nachrichten entschlüsseln
 (nötig für History an neue Channel-Mitglieder) — wie bei Slack/Telegram-

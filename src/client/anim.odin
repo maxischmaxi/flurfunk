@@ -48,7 +48,10 @@ Anim_Kind :: enum u8 {
 }
 
 anim_id :: proc(kind: Anim_Kind, v: u64) -> u64 {
-	return (u64(kind) << 56) ~ (v * 0x9E3779B97F4A7C15)
+	id := (u64(kind) << 56) ~ (v * 0x9E3779B97F4A7C15)
+	// 0 is the "no tab focus" sentinel — no widget id may ever be 0
+	// (.Rail_Hover with v == 0 used to produce exactly that).
+	return id != 0 ? id : 1
 }
 
 Anim_Store :: struct {

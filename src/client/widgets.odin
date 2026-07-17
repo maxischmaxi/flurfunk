@@ -24,11 +24,20 @@ Focus :: enum {
 	Auth_User,
 	Auth_Display,
 	Auth_Pass,
+	Auth_Invite, // invite code (registering on a closed server)
 	Setup_Name,
 	Message,
 	Edit, // Inline-Editor einer Nachricht
 	Modal_Input,
 	Switcher,
+
+	// Admin panel fields (adminui.odin)
+	Adm_Name,
+	Adm_User,
+	Adm_Display,
+	Adm_Pass,
+	Adm_Ban,
+	Adm_Reset,
 }
 
 // Ein per Tab erreichbares Widget. Die Registrierungs-Reihenfolge
@@ -143,11 +152,15 @@ ui_begin_frame :: proc(app: ^App, modal_open: bool) {
 			}
 		}
 		if len(stops) > 0 {
+			// tab_focus == 0 heißt "kein Fokus" — nie gegen Stop-IDs matchen,
+			// sonst kapert ein Widget den Start der Navigation.
 			cur := -1
-			for s, i in stops {
-				if s.id == ui.tab_focus {
-					cur = i
-					break
+			if ui.tab_focus != 0 {
+				for s, i in stops {
+					if s.id == ui.tab_focus {
+						cur = i
+						break
+					}
 				}
 			}
 			// Kein Tab-Fokus, aber ein Textfeld aktiv → von dort starten
@@ -898,6 +911,26 @@ draw_hangup :: proc(cx, cy, r, thick: f32, color: rl.Color) {
 	rl.DrawRing({cx, cy - r*0.55}, r - thick, r, 28, 152, 24, color)
 	rl.DrawCircleV({cx - r*0.86, cy - r*0.55 + r*0.45}, thick*0.72, color)
 	rl.DrawCircleV({cx + r*0.86, cy - r*0.55 + r*0.45}, thick*0.72, color)
+}
+
+// Shield outline with a small check inside (admin panel).
+draw_shield :: proc(cx, cy, size, thick: f32, color: rl.Color) {
+	h := size
+	w := size * 0.86
+	top := cy - h*0.5
+	pts := [5]rl.Vector2{
+		{cx - w/2, top},
+		{cx + w/2, top},
+		{cx + w/2, top + h*0.42},
+		{cx, top + h},
+		{cx - w/2, top + h*0.42},
+	}
+	for p, i in pts {
+		q := pts[(i + 1) % len(pts)]
+		rl.DrawLineEx(p, q, thick, color)
+		rl.DrawCircleV(p, thick/2, color)
+	}
+	draw_check(cx, cy - h*0.06, size*0.42, thick, color)
 }
 
 // Zahnrad: Ring + acht Zähne (Settings).

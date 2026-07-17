@@ -352,6 +352,9 @@ call_udp_loop :: proc() {
 		if err != nil || n <= 0 {
 			continue
 		}
+		if udp_banned(from.address) {
+			continue // banned IPs are dropped before any parsing
+		}
 		pkt := buf[:n]
 		vp, ok := shared.voice_parse(pkt)
 		if !ok {

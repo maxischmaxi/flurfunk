@@ -94,6 +94,7 @@ Server_Conn :: struct {
 	server_name:  string,
 	initialized:  bool,
 	setup_needed: bool,
+	invite_only:  bool, // registration requires an invite code
 
 	// --- nur Main-Thread ---
 	pending:        map[u64]Pending,
@@ -103,6 +104,11 @@ Server_Conn :: struct {
 	synced:         bool, // list_users/list_channels nach Ready gesendet?
 	sidebar_scroll: Scroll,
 	calls:          map[u64]Channel_Call, // laufende Calls (channel_id → Stand)
+
+	// Admin panel snapshot; every admin reply replaces it wholesale.
+	admin:         shared.Admin_State,
+	admin_loaded:  bool,
+	admin_loading: bool,
 
 	// Reconnect-Verwaltung (Main-Thread)
 	prev_phase:  Conn_Phase,
@@ -121,6 +127,7 @@ Server_Conn :: struct {
 	auth_user:     Text_Input,
 	auth_display:  Text_Input,
 	auth_pass:     Text_Input,
+	auth_invite:   Text_Input, // invite code (only when invite_only)
 	auth_error:    string,
 	auth_busy:     bool,
 	show_pass:     bool,
@@ -172,6 +179,8 @@ conn_start :: proc(c: ^Server_Conn) {
 	clear(&c.calls)
 	c.active_channel = 0
 	c.synced = false
+	c.admin_loaded = false
+	c.admin_loading = false
 	c.rtt_ms = 0
 	c.rtt_pending = false
 	c.rtt_last = 0
@@ -283,6 +292,7 @@ conn_worker :: proc(c: ^Server_Conn, gen: int) {
 	c.server_name = info.server_name
 	c.initialized = info.initialized
 	c.setup_needed = info.setup_needed
+	c.invite_only = info.invite_only
 
 	// 4. Token vorhanden → Session fortsetzen
 	next_phase := Conn_Phase.Auth_Needed

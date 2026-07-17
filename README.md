@@ -50,6 +50,15 @@ wenig Speicher und fühlen sich auch bei großen Verläufen flüssig an.
   wählen, sich selbst probehören (auch mitten im Call, ohne dass andere
   den Test hören) und Rauschunterdrückung, Echo-Cancellation und
   Sprach-Gate einzeln schalten.
+- **Admin-Panel** — Servername, Nutzer (Rollen, Deaktivieren,
+  Passwort-Reset), Channels, Einladungen und Sicherheit an einem Ort.
+  Wer den Server einrichtet, ist automatisch Administrator und kann
+  weitere ernennen.
+- **Zugangskontrolle** — Registrierung offen lassen oder schließen:
+  dann kommen neue Mitglieder nur mit Einladungscode oder einem vom
+  Admin vorab angelegten Konto hinein. Dazu Brute-Force-Schutz
+  (Fail2ban-Prinzip) und IP-Sperren, die schon vor dem Krypto-Handshake
+  greifen.
 - **Alles Erwartbare** — Ungelesen-Badges, Online-Presence,
   „Neu"-Trennlinie, Schnellsuche (`Strg+K`), Latenz-Anzeige,
   Auto-Reconnect, Text markieren und kopieren wie im Browser.
@@ -99,6 +108,16 @@ Beim ersten Start erzeugt er seine Schlüssel selbst. Wer sich als
 den Server ein (Servername). Danach lädt man sein Team ein — Clients
 verbinden sich einfach mit `host:port` (TCP **und** UDP auf dem Port
 freigeben; UDP trägt die Voice-Calls).
+
+Als Admin öffnest du über das **Schild-Icon** unten in der Seitenleiste
+das Verwaltungs-Panel. Empfehlung für Server im offenen Internet: Sobald
+das Team an Bord ist, unter **Zugang** die offene Registrierung
+abschalten — neue Leute kommen dann nur noch per Einladungscode (ein
+Klick, landet im Zwischenspeicher) oder mit einem vorab angelegten Konto
+hinein. Unter **Sicherheit** sperrt der eingebaute Brute-Force-Schutz
+Angreifer-IPs automatisch aus; einzelne IP-Adressen lassen sich auch von
+Hand sperren. Gesperrte Adressen werden bereits **vor** dem
+Verschlüsselungs-Handshake abgewiesen, auf TCP wie UDP.
 
 Der Master-Schlüssel (`master.key`) lässt sich per `-key` auf ein
 separates Medium legen — dann sind Daten und Schlüssel physisch getrennt.

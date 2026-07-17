@@ -11,6 +11,7 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:strconv"
+import "core:strings"
 import "core:sync"
 import "core:thread"
 
@@ -69,6 +70,7 @@ handle_conn :: proc(c: ^Client_Conn) {
 	defer {
 		net.close(c.sock)
 		delete(c.remote)
+		delete(c.ip)
 		free(c)
 		free_all(context.temp_allocator)
 	}
@@ -91,6 +93,9 @@ handle_conn :: proc(c: ^Client_Conn) {
 		}
 		handle_wire(c, w)
 		free_all(context.temp_allocator)
+		if c.drop {
+			break // a handler ended this connection (ban/spam)
+		}
 	}
 
 	disconnect(c)
@@ -208,15 +213,23 @@ main :: proc() {
 	free_all(context.temp_allocator)
 
 	// Accept-Loop: ein Thread pro Verbindung, räumt sich selbst auf.
+	// Banned IPs are rejected here — before the Noise handshake even starts.
 	for {
 		client, source, aerr := net.accept_tcp(listener)
 		if aerr != nil {
 			fmt.printfln("[error] accept fehlgeschlagen: %v", aerr)
 			continue
 		}
+		ip_buf: [64]byte
+		ip := format_ip(ip_buf[:], source.address)
+		if ip_banned(ip) {
+			net.close(client)
+			continue
+		}
 		c := new(Client_Conn)
 		c.sock = client
 		c.remote = net.endpoint_to_string(source, context.allocator)
+		c.ip = strings.clone(ip)
 		thread.create_and_start_with_poly_data(c, handle_conn, nil, .Normal, true)
 	}
 }

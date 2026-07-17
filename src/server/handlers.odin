@@ -41,6 +41,16 @@ handle_wire :: proc(c: ^Client_Conn, w: shared.Wire) {
 	sync.lock(&g.mu)
 	defer sync.unlock(&g.mu)
 
+	// A hard request budget applies before auth — exceeding it drops the
+	// connection (protects against pre-auth spam over a standing socket).
+	if !c.authed {
+		c.preauth_seen += 1
+		if c.preauth_seen > PREAUTH_BUDGET {
+			c.drop = true
+			return
+		}
+	}
+
 	// Unauthentifiziert sind nur server_info, register, login, resume erlaubt.
 	switch w.kind {
 	case shared.K_SERVER_INFO:
@@ -95,6 +105,26 @@ handle_wire :: proc(c: ^Client_Conn, w: shared.Wire) {
 			handle_call_leave(c, w)
 		case shared.K_CALL_MUTE:
 			handle_call_mute(c, w)
+		case shared.K_ADMIN_STATE:
+			handle_admin_state(c, w)
+		case shared.K_ADMIN_SET:
+			handle_admin_set(c, w)
+		case shared.K_ADMIN_SET_ROLE:
+			handle_admin_set_role(c, w)
+		case shared.K_ADMIN_SET_DISABLED:
+			handle_admin_set_disabled(c, w)
+		case shared.K_ADMIN_CREATE_USER:
+			handle_admin_create_user(c, w)
+		case shared.K_ADMIN_RESET_PASSWORD:
+			handle_admin_reset_password(c, w)
+		case shared.K_ADMIN_CREATE_INVITE:
+			handle_admin_create_invite(c, w)
+		case shared.K_ADMIN_REVOKE_INVITE:
+			handle_admin_revoke_invite(c, w)
+		case shared.K_ADMIN_BAN_IP:
+			handle_admin_ban_ip(c, w)
+		case shared.K_ADMIN_UNBAN_IP:
+			handle_admin_unban_ip(c, w)
 		case:
 			send_err(c, w.kind, w.seq, "invalid_request")
 		}
@@ -108,6 +138,7 @@ handle_server_info :: proc(c: ^Client_Conn, w: shared.Wire) {
 	resp.server_name = g.meta.server_name
 	resp.initialized = g.meta.initialized
 	resp.setup_needed = !g.meta.initialized
+	resp.invite_only = g.meta.initialized && g.meta.registration_closed
 	send_to(c, resp)
 }
 
@@ -115,6 +146,15 @@ handle_server_info :: proc(c: ^Client_Conn, w: shared.Wire) {
 auth_success :: proc(c: ^Client_Conn, kind: string, seq: u64, u: ^User, token: string) {
 	c.authed = true
 	c.user_id = u.id
+	security_success(c.ip)
+
+	// Last-seen tracking for the admin panel.
+	if u.last_ip != c.ip {
+		delete(u.last_ip)
+		u.last_ip = strings.clone(c.ip)
+	}
+	u.last_seen_ms = now_ms()
+	save_users()
 
 	resp := shared.wire_ok(kind, seq)
 	resp.token = token
@@ -135,6 +175,32 @@ handle_register :: proc(c: ^Client_Conn, w: shared.Wire) {
 		send_err(c, w.kind, w.seq, "invalid_request")
 		return
 	}
+
+	// Access gate: with registration closed, only a valid invite gets in.
+	// The very first user bootstraps the server and is always allowed.
+	// Failed attempts count towards the fail2ban lockout — the check runs
+	// BEFORE any Argon2 work, so probing stays cheap for us.
+	used_invite: ^Invite
+	if len(g.users) > 0 && g.meta.registration_closed {
+		code := strings.to_upper(strings.trim_space(w.invite_code), context.temp_allocator)
+		if code == "" {
+			if security_fail(c.ip) {
+				c.drop = true
+			}
+			send_err(c, w.kind, w.seq, "registration_closed")
+			return
+		}
+		used_invite = find_invite(code)
+		if used_invite == nil || used_invite.used_by != 0 ||
+		   (used_invite.expires_ms > 0 && used_invite.expires_ms <= now_ms()) {
+			if security_fail(c.ip) {
+				c.drop = true
+			}
+			send_err(c, w.kind, w.seq, "invalid_invite")
+			return
+		}
+	}
+
 	if find_user_by_name(username) != nil {
 		send_err(c, w.kind, w.seq, "username_taken")
 		return
@@ -154,6 +220,12 @@ handle_register :: proc(c: ^Client_Conn, w: shared.Wire) {
 	g.meta.next_user_id += 1
 	append(&g.users, u)
 
+	if used_invite != nil {
+		used_invite.used_by = u.id
+		used_invite.used_ms = now_ms()
+		save_invites()
+	}
+
 	token := new_token()
 	append(&g.sessions, Session{token = token, user_id = u.id, created_ms = now_ms()})
 
@@ -168,13 +240,24 @@ handle_register :: proc(c: ^Client_Conn, w: shared.Wire) {
 handle_login :: proc(c: ^Client_Conn, w: shared.Wire) {
 	u := find_user_by_name(strings.trim_space(w.username))
 	if u == nil {
+		if security_fail(c.ip) {
+			c.drop = true
+		}
 		send_err(c, w.kind, w.seq, "invalid_credentials")
 		return
 	}
 	probe: [HASH_LEN]byte
 	if !hash_password(w.password, u.salt[:], probe[:]) ||
 	   crypto.compare_constant_time(probe[:], u.pass_hash[:]) != 1 {
+		if security_fail(c.ip) {
+			c.drop = true
+		}
 		send_err(c, w.kind, w.seq, "invalid_credentials")
+		return
+	}
+	// Only AFTER the password check — otherwise the error leaks account state.
+	if u.disabled {
+		send_err(c, w.kind, w.seq, "user_disabled")
 		return
 	}
 
@@ -193,7 +276,7 @@ handle_resume :: proc(c: ^Client_Conn, w: shared.Wire) {
 		return
 	}
 	u := find_user_by_id(s.user_id)
-	if u == nil {
+	if u == nil || u.disabled {
 		send_err(c, w.kind, w.seq, "invalid_token")
 		return
 	}

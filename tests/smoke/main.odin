@@ -586,5 +586,156 @@ main :: proc() {
 	}
 	step_ok("call sauber beendet")
 
+	// 10) Admin-Panel: Rechte, Einstellungen, Einladungen, Konten
+	must_err(b, {kind = shared.K_ADMIN_STATE}, "not_allowed", "admin-gate für normale user")
+	ast := must(a, {kind = shared.K_ADMIN_STATE}, "admin_state")
+	if ast.admin.settings.f2b_max_fails != 5 || ast.admin.settings.f2b_window_min != 15 ||
+	   ast.admin.settings.f2b_ban_min != 30 || ast.admin.settings.f2b_disabled {
+		fail("admin defaults", "f2b =", ast.admin.settings)
+	}
+	if len(ast.admin.users) != 2 || len(ast.admin.channels) != 4 || ast.admin.dm_count != 1 {
+		fail("admin snapshot", "users =", len(ast.admin.users), "channels =", len(ast.admin.channels), "dms =", ast.admin.dm_count)
+	}
+	if ast.admin.settings.registration_closed {
+		fail("registrierung default", "sollte offen sein")
+	}
+
+	// Registrierung schließen (fail2ban großzügig, damit die Negativtests
+	// unten nicht vorzeitig die Test-IP sperren)
+	open_settings := shared.Admin_Settings{f2b_max_fails = 20, f2b_window_min = 15, f2b_ban_min = 30}
+	closed_settings := open_settings
+	closed_settings.registration_closed = true
+	ast2 := must(a, {kind = shared.K_ADMIN_SET, settings = closed_settings}, "registrierung schließen")
+	if !ast2.admin.settings.registration_closed || ast2.admin.settings.f2b_max_fails != 20 {
+		fail("admin_set", "settings =", ast2.admin.settings)
+	}
+
+	e := connect(addr, "E")
+	einfo := request(e, {kind = shared.K_SERVER_INFO})
+	if !einfo.invite_only {
+		fail("server_info invite_only", "flag fehlt bei geschlossener registrierung")
+	}
+	step_ok("server_info meldet invite_only")
+	must_err(e, {kind = shared.K_REGISTER, username = "eve", password = "geheim99"},
+		"registration_closed", "registrierung ohne code abgelehnt")
+	must_err(e, {kind = shared.K_REGISTER, username = "eve", password = "geheim99", invite_code = "FALSCH99"},
+		"invalid_invite", "registrierung mit falschem code abgelehnt")
+
+	// Einladung erstellen und einlösen (Code case-insensitiv)
+	cinv := must(a, {kind = shared.K_ADMIN_CREATE_INVITE, minutes = 60}, "einladung erstellen")
+	if len(cinv.invite_code) != shared.INVITE_CODE_LEN || len(cinv.admin.invites) != 1 {
+		fail("invite antwort", "code =", cinv.invite_code, "anzahl =", len(cinv.admin.invites))
+	}
+	rege := must(e, {kind = shared.K_REGISTER, username = "eve", password = "geheim99",
+		invite_code = strings.to_lower(cinv.invite_code)}, "registrierung mit code")
+	if rege.user.is_admin {
+		fail("eve-flags", "eve darf kein admin sein")
+	}
+	eve_id := rege.user.id
+	eve_token := rege.token
+	must_err(connect(addr, "E2"), {kind = shared.K_REGISTER, username = "eve2", password = "geheim99",
+		invite_code = cinv.invite_code}, "invalid_invite", "code ist einmalig")
+	ast3 := must(a, {kind = shared.K_ADMIN_STATE}, "admin_state nach einlösung")
+	if len(ast3.admin.invites) != 1 || ast3.admin.invites[0].used_by != eve_id {
+		fail("invite verbraucht", "used_by =", ast3.admin.invites[0].used_by)
+	}
+
+	// Unbefristete Einladung erstellen und widerrufen
+	cinv2 := must(a, {kind = shared.K_ADMIN_CREATE_INVITE}, "unbefristete einladung")
+	rvk := must(a, {kind = shared.K_ADMIN_REVOKE_INVITE, invite_code = cinv2.invite_code}, "einladung widerrufen")
+	if len(rvk.admin.invites) != 1 {
+		fail("revoke", "anzahl =", len(rvk.admin.invites))
+	}
+
+	// Rollen: bob befördern → bob darf admin_state; degradieren → wieder nicht
+	must(a, {kind = shared.K_ADMIN_SET_ROLE, user_id = bob_id, is_admin = true}, "bob befördern")
+	must(b, {kind = shared.K_ADMIN_STATE}, "bob darf jetzt admin_state")
+	must(a, {kind = shared.K_ADMIN_SET_ROLE, user_id = bob_id, is_admin = false}, "bob degradieren")
+	must_err(b, {kind = shared.K_ADMIN_STATE}, "not_allowed", "bob ist wieder normaler user")
+	must_err(a, {kind = shared.K_ADMIN_SET_ROLE, user_id = alice_id, is_admin = false},
+		"last_admin", "letzter admin ist geschützt")
+	must_err(a, {kind = shared.K_ADMIN_SET_DISABLED, user_id = alice_id, disabled = true},
+		"not_allowed", "selbst-deaktivierung abgelehnt")
+
+	// Deaktivieren: eves verbindung stirbt, login/resume abgelehnt
+	must(a, {kind = shared.K_ADMIN_SET_DISABLED, user_id = eve_id, disabled = true}, "eve deaktivieren")
+	closed := false
+	for _ in 0 ..< 100 {
+		if _, ok := shared.recv_wire(&e.secure); !ok {
+			closed = true
+			break
+		}
+	}
+	if !closed {
+		fail("disable trennt", "eves verbindung lebt noch")
+	}
+	step_ok("eve wurde serverseitig getrennt")
+	e2 := connect(addr, "E3")
+	must_err(e2, {kind = shared.K_LOGIN, username = "eve", password = "geheim99"},
+		"user_disabled", "login deaktiviertes konto")
+	must_err(e2, {kind = shared.K_RESUME, token = eve_token}, "invalid_token", "resume deaktiviertes konto")
+	must(a, {kind = shared.K_ADMIN_SET_DISABLED, user_id = eve_id, disabled = false}, "eve reaktivieren")
+	must(e2, {kind = shared.K_LOGIN, username = "eve", password = "geheim99"}, "eve login nach reaktivierung")
+
+	// Vorab erstelltes Konto + Passwort-Reset durch den Admin
+	cu := must(a, {kind = shared.K_ADMIN_CREATE_USER, username = "carol", password = "start123",
+		display_name = "Carol"}, "konto vorab anlegen")
+	carol_id := cu.user.id
+	if cu.user.is_admin || carol_id == 0 {
+		fail("carol-flags", "vorab-konto falsch")
+	}
+	f1 := connect(addr, "F1")
+	must(f1, {kind = shared.K_LOGIN, username = "carol", password = "start123"}, "login vorab-konto")
+	must(a, {kind = shared.K_ADMIN_RESET_PASSWORD, user_id = carol_id, password = "neu12345"}, "passwort-reset")
+	f2 := connect(addr, "F2")
+	must_err(f2, {kind = shared.K_LOGIN, username = "carol", password = "start123"},
+		"invalid_credentials", "altes passwort tot")
+	must(f2, {kind = shared.K_LOGIN, username = "carol", password = "neu12345"}, "neues passwort gilt")
+
+	// 11) IP-Bans + fail2ban (zum Schluss — sperrt zeitweise die Test-IP)
+	must_err(a, {kind = shared.K_ADMIN_BAN_IP, ip = "127.0.0.1"}, "own_ip", "eigene ip nicht sperrbar")
+	must_err(a, {kind = shared.K_ADMIN_BAN_IP, ip = "kein-ip"}, "invalid_request", "kaputte ip abgelehnt")
+	bn := must(a, {kind = shared.K_ADMIN_BAN_IP, ip = "203.0.113.7", minutes = 30}, "fremde ip sperren")
+	if len(bn.admin.bans) != 1 || bn.admin.bans[0].ip != "203.0.113.7" || bn.admin.bans[0].expires_ms == 0 {
+		fail("ban-liste", "bans =", len(bn.admin.bans))
+	}
+	unb := must(a, {kind = shared.K_ADMIN_UNBAN_IP, ip = "203.0.113.7"}, "ip entsperren")
+	if len(unb.admin.bans) != 0 {
+		fail("unban", "bans =", len(unb.admin.bans))
+	}
+
+	// fail2ban scharf stellen: 3 Fehlversuche → Sperre. Der letzte
+	// erfolgreiche Login (f2) hat den Zähler der Test-IP geleert.
+	strict := open_settings
+	strict.f2b_max_fails = 3
+	must(a, {kind = shared.K_ADMIN_SET, settings = strict}, "fail2ban auf 3 versuche")
+	g1 := connect(addr, "G")
+	for i in 0 ..< 3 {
+		r := request(g1, {kind = shared.K_LOGIN, username = "alice", password = fmt.tprintf("falsch%03d", i)})
+		if r.err != "invalid_credentials" {
+			fail("brute-force versuch", "err =", r.err)
+		}
+	}
+	step_ok("3 fehlversuche produziert")
+	// Neue Verbindungen von dieser IP werden jetzt VOR dem Handshake gekappt
+	{
+		sock, derr := net.dial_tcp(addr)
+		if derr == nil {
+			tc: Test_Conn
+			if shared.generate_static_key(&tc.priv) && shared.client_handshake(&tc.secure, sock, &tc.priv) {
+				fail("fail2ban gate", "handshake ging trotz sperre durch")
+			}
+			net.close(sock)
+		}
+		step_ok("gesperrte ip kommt nicht mehr durch den handshake")
+	}
+	// Bestehende Admin-Verbindung lebt weiter → entsperren
+	ub2 := must(a, {kind = shared.K_ADMIN_UNBAN_IP, ip = "127.0.0.1"}, "test-ip entsperren")
+	if len(ub2.admin.bans) != 0 {
+		fail("unban test-ip", "bans =", len(ub2.admin.bans))
+	}
+	g2 := connect(addr, "G2")
+	must(g2, {kind = shared.K_LOGIN, username = "bob", password = "huntert2"}, "login nach entsperrung")
+
 	fmt.println("\nALLE SMOKE-TESTS BESTANDEN ✔")
 }

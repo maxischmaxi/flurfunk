@@ -300,6 +300,26 @@ draw_sidebar :: proc(app: ^App, c: ^Server_Conn, phase: Conn_Phase, sh: f32) {
 		if ui_click(&app.ui, gr, .Base) || (focused && app.ui.tab_activate) {
 			open_settings(app)
 		}
+
+		// Shield → server administration (admins only)
+		if c.me.is_admin {
+			ar := rl.Rectangle{gr.x - 36, gr.y, 32, 32}
+			ahov := ui_hover(&app.ui, ar, .Base)
+			afoc := tab_stop(app, anim_id(.Misc, 0xAD01), ar, .Base, radius = 8)
+			at := anim_to(app, anim_id(.Misc, 0xAD01), (ahov || afoc) ? 1 : 0)
+			rrect(ar, 8, fade(COL_OVERLAY, at*0.08))
+			if afoc {
+				draw_focus_ring(ar, 8)
+			}
+			draw_shield(ar.x + ar.width/2, ar.y + ar.height/2, 15, 1.8, mix(COL_SIDEBAR_DIM, COL_TEXT, at))
+			if ahov {
+				app.ui.cursor = .POINTING_HAND
+			}
+			tooltip(app, anim_id(.Misc, 0xAD02), ar, "Server verwalten", .Base)
+			if ui_click(&app.ui, ar, .Base) || (afoc && app.ui.tab_activate) {
+				open_admin(app, c)
+			}
+		}
 	}
 }
 

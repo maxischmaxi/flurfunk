@@ -303,17 +303,22 @@ card_frame :: proc(app: ^App, chat: rl.Rectangle, w, h: f32) -> rl.Rectangle {
 draw_auth :: proc(app: ^App, c: ^Server_Conn, chat: rl.Rectangle) {
 	fresh := !c.initialized // frischer Server → nur Registrieren, erster User wird Admin
 	register := fresh || c.auth_tab == 1
+	need_invite := register && !fresh && c.invite_only
 
 	h := f32(register ? 424 : 372)
 	if fresh {
 		h = 434
+	}
+	if need_invite {
+		h += 72
 	}
 	p := card_frame(app, chat, 420, h)
 
 	// Beim Betreten des Formulars das erste Feld fokussieren.
 	// Tab/Shift+Tab übernimmt die globale Tab-Navigation (widgets.odin).
 	in_form := app.ui.focus == .Auth_User || app.ui.focus == .Auth_Pass ||
-		(register && app.ui.focus == .Auth_Display)
+		(register && app.ui.focus == .Auth_Display) ||
+		(need_invite && app.ui.focus == .Auth_Invite)
 	if !in_form && app.modal == .None && !app.ui.tab_nav {
 		app.ui.focus = .Auth_User
 	}
@@ -375,26 +380,37 @@ draw_auth :: proc(app: ^App, c: ^Server_Conn, chat: rl.Rectangle) {
 		y += 52
 	}
 
+	if need_invite {
+		// Registration is invite-only on this server (server_info flag).
+		draw_text(app.fonts.regular13, "Einladungscode", {field_x, y}, 13, 0, COL_TEXT_DIM)
+		y += 20
+		submitted |= text_field(app, {field_x, y, field_w, 40}, &c.auth_invite, .Auth_Invite, .Base, "z. B. K7RTQW2M")
+		y += 52
+	}
+
 	draw_text(app.fonts.regular13, "Passwort", {field_x, y}, 13, 0, COL_TEXT_DIM)
-	// Anzeigen/Verbergen-Umschalter
+	label_y := y
+	y += 20
+	submitted |= text_field(app, {field_x, y, field_w, 40}, &c.auth_pass, .Auth_Pass, .Base,
+		register ? "mindestens 6 Zeichen" : "Passwort", password = !c.show_pass)
+	y += 54
+
+	// Show/hide toggle — registered AFTER the field so Tab reaches the
+	// password field first and the link second.
 	toggle_label := c.show_pass ? "verbergen" : "anzeigen"
 	tlw := rl.MeasureTextEx(app.fonts.regular13, tcstr(toggle_label), 13, 0).x
-	tr := rl.Rectangle{field_x + field_w - tlw - 4, y - 2, tlw + 8, 18}
+	tr := rl.Rectangle{field_x + field_w - tlw - 4, label_y - 2, tlw + 8, 18}
 	toggle_focused := tab_stop(app, anim_id(.Misc, 0x9A55), tr, .Base, radius = 4)
 	if toggle_focused {
 		draw_focus_ring(tr, 4)
 	}
-	draw_text(app.fonts.regular13, tcstr(toggle_label), {tr.x + 4, y}, 13, 0, COL_ACCENT)
+	draw_text(app.fonts.regular13, tcstr(toggle_label), {tr.x + 4, label_y}, 13, 0, COL_ACCENT)
 	if ui_hover(&app.ui, tr, .Base) {
 		app.ui.cursor = .POINTING_HAND
 	}
 	if ui_click(&app.ui, tr, .Base) || (toggle_focused && app.ui.tab_activate) {
 		c.show_pass = !c.show_pass
 	}
-	y += 20
-	submitted |= text_field(app, {field_x, y, field_w, 40}, &c.auth_pass, .Auth_Pass, .Base,
-		register ? "mindestens 6 Zeichen" : "Passwort", password = !c.show_pass)
-	y += 54
 
 	btn_label := register ? (fresh ? "Server einrichten" : "Konto erstellen") : "Anmelden"
 	if c.auth_busy {
@@ -431,11 +447,17 @@ auth_submit :: proc(app: ^App, c: ^Server_Conn, register: bool) {
 		c.auth_error = "Passwort: mindestens 6 Zeichen"
 		return
 	}
+	invite := strings.trim_space(ti_text(&c.auth_invite))
+	if register && c.initialized && c.invite_only && invite == "" {
+		c.auth_error = "Dieser Server braucht einen Einladungscode"
+		return
+	}
 	c.auth_error = ""
 	c.auth_busy = true
 	if register {
 		disp := strings.trim_space(ti_text(&c.auth_display))
-		conn_request(c, {kind = shared.K_REGISTER, username = user, password = pass, display_name = disp})
+		conn_request(c, {kind = shared.K_REGISTER, username = user, password = pass,
+			display_name = disp, invite_code = invite})
 	} else {
 		conn_request(c, {kind = shared.K_LOGIN, username = user, password = pass})
 	}

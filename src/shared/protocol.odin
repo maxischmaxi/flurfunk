@@ -48,6 +48,20 @@ K_CALL_MUTE  :: "call_mute" // muted-Flag setzen (nur Anzeige für andere)
 // der Client misst daraus die TCP-Latenz (Indikator in der Kopfzeile).
 K_PING :: "ping"
 
+// Admin panel. All of these require an admin caller; every successful reply
+// carries a fresh Admin_State snapshot so the client never has to sync
+// increments. Server settings changes go through admin_set as a whole.
+K_ADMIN_STATE          :: "admin_state"
+K_ADMIN_SET            :: "admin_set"            // settings (whole struct)
+K_ADMIN_SET_ROLE       :: "admin_set_role"       // user_id + is_admin
+K_ADMIN_SET_DISABLED   :: "admin_set_disabled"   // user_id + disabled
+K_ADMIN_CREATE_USER    :: "admin_create_user"    // username/password/display_name
+K_ADMIN_RESET_PASSWORD :: "admin_reset_password" // user_id + password
+K_ADMIN_CREATE_INVITE  :: "admin_create_invite"  // minutes (0 = no expiry)
+K_ADMIN_REVOKE_INVITE  :: "admin_revoke_invite"  // invite_code
+K_ADMIN_BAN_IP         :: "admin_ban_ip"         // ip + minutes (0 = permanent)
+K_ADMIN_UNBAN_IP       :: "admin_unban_ip"       // ip
+
 // Server -> Client Events (seq == 0)
 EV_MESSAGE         :: "ev_message"         // neue Chat-Nachricht
 EV_MESSAGE_EDITED  :: "ev_message_edited"  // Nachricht wurde bearbeitet (message = neuer Stand)
@@ -64,14 +78,68 @@ MIN_PASSWORD_LEN     :: 6
 HISTORY_MAX_LIMIT    :: 100
 EDIT_WINDOW_MS       :: 60 * 1000
 MAX_MESSAGE_EDITS    :: 3
+INVITE_CODE_LEN      :: 8
 
 User :: struct {
 	id:           u64    `json:"id"`,
 	username:     string `json:"username"`,
 	display_name: string `json:"display_name,omitempty"`,
 	is_admin:     bool   `json:"is_admin,omitempty"`,
+	disabled:     bool   `json:"disabled,omitempty"`, // account disabled by an admin
 	online:       bool   `json:"online,omitempty"`,
 	in_call:      bool   `json:"in_call,omitempty"`, // Headphone-Anzeige
+}
+
+// Server settings the admin can change (absolute values, sent as a whole).
+// The f2b_* fields configure the fail2ban-style brute-force lockout.
+Admin_Settings :: struct {
+	registration_closed: bool `json:"registration_closed,omitempty"`,
+	f2b_disabled:        bool `json:"f2b_disabled,omitempty"`,
+	f2b_max_fails:       int  `json:"f2b_max_fails,omitempty"`,
+	f2b_window_min:      int  `json:"f2b_window_min,omitempty"`,
+	f2b_ban_min:         int  `json:"f2b_ban_min,omitempty"`,
+}
+
+Invite_Info :: struct {
+	code:       string `json:"code"`,
+	created_ms: i64    `json:"created_ms"`,
+	expires_ms: i64    `json:"expires_ms,omitempty"`, // 0 = no expiry
+	created_by: u64    `json:"created_by"`,
+	used_by:    u64    `json:"used_by,omitempty"`, // 0 = unused
+	used_ms:    i64    `json:"used_ms,omitempty"`,
+}
+
+Ban_Info :: struct {
+	ip:         string `json:"ip"`,
+	reason:     string `json:"reason,omitempty"`,
+	created_ms: i64    `json:"created_ms"`,
+	expires_ms: i64    `json:"expires_ms,omitempty"`, // 0 = permanent
+	by_user:    u64    `json:"by_user,omitempty"`,    // 0 = fail2ban
+}
+
+// Admin-only per-user details; joined with the regular user list by id.
+Admin_User :: struct {
+	id:           u64    `json:"id"`,
+	disabled:     bool   `json:"disabled,omitempty"`,
+	last_ip:      string `json:"last_ip,omitempty"`,
+	last_seen_ms: i64    `json:"last_seen_ms,omitempty"`,
+}
+
+// All non-DM channels, including those the admin is not a member of.
+Admin_Channel :: struct {
+	id:         u64    `json:"id"`,
+	name:       string `json:"name"`,
+	creator_id: u64    `json:"creator_id,omitempty"`,
+	members:    int    `json:"members"`,
+}
+
+Admin_State :: struct {
+	settings: Admin_Settings  `json:"settings"`,
+	users:    []Admin_User    `json:"users,omitempty"`,
+	channels: []Admin_Channel `json:"channels,omitempty"`,
+	invites:  []Invite_Info   `json:"invites,omitempty"`,
+	bans:     []Ban_Info      `json:"bans,omitempty"`,
+	dm_count: int             `json:"dm_count,omitempty"`,
 }
 
 // Teilnehmer eines laufenden Calls.
@@ -131,6 +199,7 @@ Wire :: struct {
 	server_name:  string `json:"server_name,omitempty"`,
 	initialized:  bool   `json:"initialized,omitempty"`,  // Setup abgeschlossen
 	setup_needed: bool   `json:"setup_needed,omitempty"`, // dieser Client muss Setup durchführen
+	invite_only:  bool   `json:"invite_only,omitempty"`,  // registration requires an invite code
 
 	// Entities
 	user:     User         `json:"user,omitempty"`,
@@ -148,6 +217,15 @@ Wire :: struct {
 	text:       string `json:"text,omitempty"`,
 	before_id:  u64    `json:"before_id,omitempty"`,
 	limit:      int    `json:"limit,omitempty"`,
+
+	// Admin / Zugang
+	invite_code: string         `json:"invite_code,omitempty"`, // register + invite management
+	ip:          string         `json:"ip,omitempty"`,
+	minutes:     int            `json:"minutes,omitempty"`, // validity/ban duration (0 = unlimited)
+	is_admin:    bool           `json:"is_admin,omitempty"`,
+	disabled:    bool           `json:"disabled,omitempty"`,
+	settings:    Admin_Settings `json:"settings,omitempty"`,
+	admin:       Admin_State    `json:"admin,omitempty"`,
 
 	// Voice-Calls
 	call:      Call_Info   `json:"call,omitempty"`,      // EV_CALL_STATE / call_join-Reply

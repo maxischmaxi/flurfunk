@@ -25,6 +25,7 @@ Modal_Kind :: enum {
 	Confirm_Delete, // Kanal löschen bestätigen (app.confirm_channel)
 	Msg_History,    // Bearbeitungsverlauf einer Nachricht (Sheet von rechts)
 	Settings,       // App-Einstellungen (Audio-Geräte + Selbsttest)
+	Admin,          // server administration (adminui.odin, admins only)
 }
 
 // Kontextmenü (Rechtsklick auf einen Kanal in der Sidebar).
@@ -104,6 +105,19 @@ App :: struct {
 
 	welcome_input: Text_Input,
 	welcome_error: string,
+
+	// Admin panel (adminui.odin): tab, inputs and inline confirmations.
+	adm_tab:         int,
+	adm_name_input:  Text_Input, // server name (general tab)
+	adm_user_input:  Text_Input, // create account: username
+	adm_disp_input:  Text_Input, // create account: display name
+	adm_pass_input:  Text_Input, // create account: password
+	adm_invite_sel:  int,        // validity of new invites (index)
+	adm_ban_input:   Text_Input, // ban IP: address
+	adm_ban_sel:     int,        // ban IP: duration (index)
+	adm_reset_user:  u64,        // password reset: open row (0 = none)
+	adm_reset_input: Text_Input,
+	adm_confirm_del: u64, // channels tab: two-step delete (channel id)
 
 	tz: ^datetime.TZ_Region, // lokale Zeitzone (nil → UTC)
 }
@@ -379,7 +393,18 @@ app_apply_wire :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, is_active_ser
 		}
 		app_remove_channel(c, w.channel_id)
 	case shared.EV_USER:
+		was_admin := c.me.is_admin
 		app_upsert_user(c, w.user)
+		// Demoted while the panel is open → it has to go.
+		if w.user.id == c.me.id && was_admin && !c.me.is_admin {
+			if app.modal == .Admin && c == app_active_conn(app) {
+				close_modal(app)
+			}
+			toast(app, .Info, "Du bist kein Administrator mehr")
+		}
+		if w.user.id == c.me.id && !was_admin && c.me.is_admin {
+			toast(app, .Success, "Du bist jetzt Administrator")
+		}
 	case shared.EV_SERVER:
 		c.server_name = strings.clone(w.server_name)
 		app_sync_config(app, c)
@@ -412,18 +437,30 @@ app_apply_reply :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, p: Pending) 
 
 	case shared.K_SETUP:
 		if !w.ok {
-			c.setup_error = strings.clone(translate_err(w.err))
+			if app.modal == .Admin {
+				toast(app, .Error, translate_err(w.err))
+			} else {
+				c.setup_error = strings.clone(translate_err(w.err))
+			}
 			return
 		}
+		// K_SETUP doubles as the rename request from the admin panel.
+		renamed := c.initialized
 		c.server_name = strings.clone(w.server_name)
 		c.initialized = true
 		c.setup_needed = false
 		sync.lock(&c.mu)
-		c.phase = .Ready
+		if c.phase == .Setup_Needed {
+			c.phase = .Ready
+		}
 		sync.unlock(&c.mu)
 		app_sync_config(app, c)
-		app.ui.focus = .Message
-		toast(app, .Success, fmt.tprintf("Server „%s“ ist eingerichtet", c.server_name))
+		if renamed {
+			toast(app, .Success, "Servername gespeichert")
+		} else {
+			app.ui.focus = .Message
+			toast(app, .Success, fmt.tprintf("Server „%s“ ist eingerichtet", c.server_name))
+		}
 
 	case shared.K_LIST_USERS:
 		clear(&c.users)
@@ -490,8 +527,14 @@ app_apply_reply :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, p: Pending) 
 		}
 		if cs := conn_find_channel(c, p.channel_id); cs != nil {
 			toast(app, .Success, fmt.tprintf("Kanal #%s gelöscht", cs.ch.name))
+		} else if app.modal == .Admin {
+			toast(app, .Success, "Kanal gelöscht")
 		}
 		app_remove_channel(c, p.channel_id)
+		// The admin panel lists ALL channels — refresh its snapshot.
+		if app.modal == .Admin && c == app_active_conn(app) {
+			conn_request(c, {kind = shared.K_ADMIN_STATE})
+		}
 
 	case shared.K_SEND:
 		if !w.ok {
@@ -547,6 +590,13 @@ app_apply_reply :: proc(app: ^App, c: ^Server_Conn, w: shared.Wire, p: Pending) 
 		rtt := f32(mono_ms() - c.rtt_sent)
 		// Geglättet, damit die Anzeige nicht zappelt (erster Wert direkt)
 		c.rtt_ms = c.rtt_ms <= 0 ? rtt : c.rtt_ms*0.6 + rtt*0.4
+
+	case shared.K_ADMIN_STATE, shared.K_ADMIN_SET, shared.K_ADMIN_SET_ROLE,
+	     shared.K_ADMIN_SET_DISABLED, shared.K_ADMIN_CREATE_USER,
+	     shared.K_ADMIN_RESET_PASSWORD, shared.K_ADMIN_CREATE_INVITE,
+	     shared.K_ADMIN_REVOKE_INVITE, shared.K_ADMIN_BAN_IP,
+	     shared.K_ADMIN_UNBAN_IP:
+		admin_apply_reply(app, c, w, p)
 
 	case shared.K_MESSAGE_HISTORY:
 		if app.modal != .Msg_History || app.history_msg_id != p.message_id {
@@ -783,6 +833,16 @@ translate_err :: proc(code: string) -> string {
 		return "Die Bearbeitungsfrist (1 Minute) ist abgelaufen"
 	case "edit_limit":
 		return "Diese Nachricht wurde bereits 3-mal bearbeitet"
+	case "registration_closed":
+		return "Die Registrierung ist geschlossen — du brauchst eine Einladung"
+	case "invalid_invite":
+		return "Einladungscode ungültig, abgelaufen oder bereits benutzt"
+	case "user_disabled":
+		return "Dieses Konto wurde deaktiviert"
+	case "last_admin":
+		return "Der letzte Administrator kann nicht entfernt werden"
+	case "own_ip":
+		return "Das ist deine eigene IP-Adresse"
 	}
 	return fmt.tprintf("Fehler: %s", code)
 }

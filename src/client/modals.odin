@@ -19,7 +19,7 @@ open_modal :: proc(app: ^App, kind: Modal_Kind) {
 	app.switcher_sel = 0
 	app.anim.vals[anim_id(.Modal_Open, 1)] = 0 // Öffnungs-Animation neu starten
 	#partial switch kind {
-	case .Members, .Msg_History, .Settings:
+	case .Members, .Msg_History, .Settings, .Admin:
 		app.ui.focus = .None
 	case .Quick_Switch:
 		app.ui.focus = .Switcher
@@ -124,6 +124,9 @@ draw_modals :: proc(app: ^App, c: ^Server_Conn, sw, sh: f32) {
 
 	case .Settings:
 		draw_settings_modal(app, sw, sh)
+
+	case .Admin:
+		draw_admin_modal(app, c, sw, sh)
 
 	case .Quick_Switch:
 		draw_quick_switcher(app, c, sw, sh)

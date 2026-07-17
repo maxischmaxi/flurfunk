@@ -21,8 +21,21 @@ User :: struct {
 	username:     string,
 	display_name: string,
 	is_admin:     bool,
+	disabled:     bool, // disabled accounts cannot sign in
+	last_ip:      string, // IP of the last successful auth (admin panel)
+	last_seen_ms: i64,
 	salt:         [SALT_LEN]byte,
 	pass_hash:    [HASH_LEN]byte,
+}
+
+// Invite code for registering while the server is closed.
+Invite :: struct {
+	code:       string,
+	created_ms: i64,
+	expires_ms: i64, // 0 = no expiry
+	created_by: u64,
+	used_by:    u64, // 0 = unused
+	used_ms:    i64,
 }
 
 // Channel bzw. DM. `key` ist der entpackte Channel-Key —
@@ -42,23 +55,37 @@ Session :: struct {
 	created_ms: i64,
 }
 
-// Persistierte Server-Metadaten (server.json).
+// Persistierte Server-Metadaten (server.json). The admin settings are
+// encoded so the zero value matches the previous behavior — old
+// server.json files load unchanged (open registration, fail2ban on).
 Server_Meta :: struct {
 	server_name:     string `json:"server_name"`,
 	initialized:     bool   `json:"initialized"`,
 	next_user_id:    u64    `json:"next_user_id"`,
 	next_channel_id: u64    `json:"next_channel_id"`,
 	next_message_id: u64    `json:"next_message_id"`,
+
+	registration_closed: bool `json:"registration_closed,omitempty"`,
+	f2b_disabled:        bool `json:"f2b_disabled,omitempty"`,
+	f2b_max_fails:       int  `json:"f2b_max_fails,omitempty"`,
+	f2b_window_min:      int  `json:"f2b_window_min,omitempty"`,
+	f2b_ban_min:         int  `json:"f2b_ban_min,omitempty"`,
 }
 
 // Eine Client-Verbindung; lebt in ihrem eigenen Thread.
 Client_Conn :: struct {
-	sock:    net.TCP_Socket,
-	sc:      shared.Secure_Conn,
-	authed:  bool,
-	user_id: u64,
-	remote:  string, // Gegenstelle, nur fürs Logging
+	sock:          net.TCP_Socket,
+	sc:            shared.Secure_Conn,
+	authed:        bool,
+	user_id:       u64,
+	remote:        string, // Gegenstelle, nur fürs Logging
+	ip:            string, // IP without the port (bans/fail2ban)
+	drop:          bool,   // a handler wants this connection closed
+	preauth_seen:  int,    // requests before auth (spam budget)
 }
+
+// Requests allowed per connection before auth — anything more is spam.
+PREAUTH_BUDGET :: 20
 
 Server_State :: struct {
 	mu:         sync.Mutex,
@@ -68,6 +95,7 @@ Server_State :: struct {
 	users:      [dynamic]User,
 	sessions:   [dynamic]Session,
 	channels:   [dynamic]Channel,
+	invites:    [dynamic]Invite,
 	conns:      [dynamic]^Client_Conn,
 
 	// Offene Bearbeitungs-Freigaben (message_id → user_id). edit_start prüft
@@ -116,6 +144,46 @@ find_session :: proc(token: string) -> ^Session {
 	return nil
 }
 
+find_invite :: proc(code: string) -> ^Invite {
+	for &inv in g.invites {
+		if inv.code == code {
+			return &inv
+		}
+	}
+	return nil
+}
+
+// Drops all sessions of one user (password reset/deactivation).
+drop_user_sessions :: proc(user_id: u64) {
+	for i := len(g.sessions) - 1; i >= 0; i -= 1 {
+		if g.sessions[i].user_id == user_id {
+			delete(g.sessions[i].token)
+			ordered_remove(&g.sessions, i)
+		}
+	}
+	save_sessions()
+}
+
+// Cuts open connections of one user. shutdown (not close!) — close would
+// leave the owning thread stuck in its blocking recv; shutdown wakes it
+// with EOF and the thread cleans up itself. `except` protects the caller.
+close_user_conns :: proc(user_id: u64, except: ^Client_Conn) {
+	for conn in g.conns {
+		if conn != except && conn.authed && conn.user_id == user_id {
+			_ = net.shutdown(conn.sock, .Both)
+		}
+	}
+}
+
+// Cuts open connections from one IP (after an IP ban); see above re shutdown.
+close_ip_conns :: proc(ip: string, except: ^Client_Conn) {
+	for conn in g.conns {
+		if conn != except && conn.ip == ip {
+			_ = net.shutdown(conn.sock, .Both)
+		}
+	}
+}
+
 is_member :: proc(ch: ^Channel, user_id: u64) -> bool {
 	for id in ch.member_ids {
 		if id == user_id {
@@ -152,6 +220,7 @@ wire_user :: proc(u: ^User) -> shared.User {
 		username     = u.username,
 		display_name = u.display_name,
 		is_admin     = u.is_admin,
+		disabled     = u.disabled,
 		online       = user_online(u.id),
 		in_call      = call_user_active(u.id),
 	}
